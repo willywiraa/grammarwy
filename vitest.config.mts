@@ -16,12 +16,12 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: ["./vitest.setup.ts"],
     include: ["src/**/*.test.{ts,tsx}"],
-    // Live tests call the real Claude API and cost money. They run only with
+    // Live tests call the real AI, which can cost money. They run only with
     // `npm run test:live` (vitest.live.config.mts).
     exclude: [...configDefaults.exclude, "src/**/*.live.test.{ts,tsx}"],
     // A safety net: these tests never see a real API key, even one set on
     // this computer, and never start the real Claude Code, so they can
-    // never call Claude by mistake. Tests that need other values stub them.
-    env: { ANTHROPIC_API_KEY: "", AI_PROVIDER: "anthropic-api", CLAUDE_CODE_PATH: "" },
+    // never call an AI by mistake. Tests that need other values stub them.
+    env: { ANTHROPIC_API_KEY: "", GEMINI_API_KEY: "", AI_PROVIDER: "anthropic-api", CLAUDE_CODE_PATH: "" },
   },
 });

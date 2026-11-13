@@ -1,7 +1,8 @@
-// Live tests: real corrections from Claude, using the test texts below. They use the same connection as the app (readProvider): your
-// Claude plan through Claude Code, or the API, which costs a little money
-// (well under $1 per run). So `npm test` never runs them. Run them on purpose
-// with `npm run test:live`.
+// Live tests: real corrections from the AI, using the test texts below. They
+// use the same connection as the app (readProvider): your Claude plan through
+// Claude Code, Gemini's free tier, or the Anthropic API, which costs a little
+// money (well under $1 per run). So `npm test` never runs them. Run them on
+// purpose with `npm run test:live`.
 //
 // Each run also writes a report with every answer to live-results/
 // (git-ignored), for the manual quality review.
@@ -9,8 +10,16 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it, vi, type MockInstance } from "vitest";
 import { getCorrection, MAX_EXPLANATIONS, readProvider } from "@/lib/ai";
 import { DEFAULT_EFFORT, DEFAULT_MODEL } from "@/lib/ai/claude";
+import { DEFAULT_GEMINI_MODEL, GEMINI_THINKING_LEVEL } from "@/lib/ai/gemini";
 import { CorrectionError } from "@/lib/api-errors";
 import type { CorrectionResult } from "@/lib/correction-schema";
+import { wait } from "@/lib/wait";
+
+/**
+ * Gemini's free tier allows only a few requests per minute, so its texts are
+ * sent with a 12-second pause in between: never more than 5 per minute.
+ */
+const GEMINI_PAUSE_MS = 12_000;
 
 type LiveCase = {
   name: string;
@@ -229,12 +238,14 @@ const logLines: string[] = [];
 let consoleInfo: MockInstance<typeof console.info>;
 
 beforeAll(() => {
-  if (readProvider() === "anthropic-api" && !process.env.ANTHROPIC_API_KEY?.trim()) {
-    throw new Error("AI_PROVIDER is anthropic-api, but ANTHROPIC_API_KEY isn't set. Add it to .env.local first.");
+  const provider = readProvider();
+  const keyName = { "claude-code": null, "anthropic-api": "ANTHROPIC_API_KEY", gemini: "GEMINI_API_KEY" }[provider];
+  if (keyName && !process.env[keyName]?.trim()) {
+    throw new Error(`AI_PROVIDER is ${provider}, but ${keyName} isn't set. Add it to .env.local first.`);
   }
-  // The live tests always use Claude, whatever .env.local says.
+  // The live tests always use the real AI, whatever .env.local says.
   vi.stubEnv("USE_MOCK_AI", "false");
-  // Keep the [ai/claude] or [ai/claude-code] log lines for the report (model, tokens, time).
+  // Keep the [ai/claude], [ai/claude-code] or [ai/gemini] log lines for the report (model, tokens, time).
   consoleInfo = vi.spyOn(console, "info").mockImplementation((line) => {
     logLines.push(String(line));
   });
@@ -246,8 +257,9 @@ afterAll(() => {
   writeReport();
 });
 
-describe("live corrections with the real Claude", () => {
+describe("live corrections with the real AI", () => {
   it.each(CASES)("$name", async ({ name, text, check }) => {
+    if (readProvider() === "gemini" && report.length > 0) await wait(GEMINI_PAUSE_MS);
     const linesBefore = logLines.length;
     const started = Date.now();
     let result: CorrectionResult | undefined;
@@ -272,8 +284,14 @@ function writeReport(): void {
   if (report.length === 0) return;
 
   const provider = readProvider();
-  const model = process.env.ANTHROPIC_MODEL?.trim() || DEFAULT_MODEL;
-  const effort = process.env.ANTHROPIC_EFFORT?.trim() || DEFAULT_EFFORT;
+  const gemini = provider === "gemini";
+  const model = gemini
+    ? process.env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL
+    : process.env.ANTHROPIC_MODEL?.trim() || DEFAULT_MODEL;
+  // Claude's effort level, or how much Gemini thinks.
+  const effort = gemini
+    ? GEMINI_THINKING_LEVEL.toLowerCase()
+    : process.env.ANTHROPIC_EFFORT?.trim() || DEFAULT_EFFORT;
   const passed = report.filter((entry) => !entry.failure && entry.problems.length === 0).length;
   const seconds = report.reduce((sum, entry) => sum + entry.seconds, 0);
   const tokens = { in: 0, out: 0 };
@@ -289,14 +307,16 @@ function writeReport(): void {
   const cost =
     provider === "claude-code"
       ? "used your Claude plan, no API bill"
-      : `about $${dollars.toFixed(2)} at Opus 5.5 prices`;
+      : gemini
+        ? "free on Gemini's free tier"
+        : `about $${dollars.toFixed(2)} at Opus 5.5 prices`;
 
   const out: string[] = [
     "# Live test results",
     "",
     `- Date: ${new Date().toISOString()}`,
     `- Connection: ${provider}`,
-    `- Model: ${model}, effort: ${effort}`,
+    `- Model: ${model}, ${gemini ? "thinking level" : "effort"}: ${effort}`,
     `- Passed: ${passed} of ${report.length}`,
     `- Total time: ${seconds.toFixed(1)} s`,
     `- Tokens: ${tokens.in} in, ${tokens.out} out (${cost})`,

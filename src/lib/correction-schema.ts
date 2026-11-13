@@ -5,7 +5,7 @@ import { z } from "zod";
 //
 // This one schema is used three ways:
 // 1. It gives us the TypeScript types at the bottom of this file.
-// 2. It is turned into the JSON schema that makes Claude answer in exactly this shape.
+// 2. It is turned into the JSON schema that makes the AI answer in exactly this shape.
 // 3. The server checks every AI answer against it before using it.
 
 /** One item in "What was fixed and why". */

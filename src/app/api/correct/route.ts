@@ -4,7 +4,7 @@ import { checkText } from "@/lib/validation";
 
 /**
  * The longest this route may run on Vercel, in seconds: the maximum (and
- * default) on the free Hobby plan. Our own deadline for Claude (DEADLINE_MS,
+ * default) on the free Hobby plan. Our own deadline for the AI (DEADLINE_MS,
  * 240 seconds) ends first, so a slow answer gets our friendly timeout message
  * instead of Vercel's error.
  */

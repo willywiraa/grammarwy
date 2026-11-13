@@ -9,18 +9,14 @@ import { spawn } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { z } from "zod";
 
+import { ANSWER_JSON_SCHEMA } from "@/lib/ai/answer-schema";
 import { DEADLINE_MS, DEFAULT_MODEL, readEffort, type Effort } from "@/lib/ai/claude";
 import { buildUserMessage, SYSTEM_PROMPT } from "@/lib/ai/prompt";
 import { CorrectionError } from "@/lib/api-errors";
-import { CorrectionResultSchema } from "@/lib/correction-schema";
 
-// Our answer format as a JSON schema. Claude Code rejects the "$schema" line
-// that Zod adds, so it is left out.
-const answerSchema = z.toJSONSchema(CorrectionResultSchema);
-delete answerSchema.$schema;
-export const ANSWER_SCHEMA = JSON.stringify(answerSchema);
+/** Our answer format, as the JSON text that Claude Code's --json-schema option takes. */
+export const ANSWER_SCHEMA = JSON.stringify(ANSWER_JSON_SCHEMA);
 
 /** What Claude Code prints with --output-format json. Only the fields we read. */
 type ClaudeCodeOutput = {
