@@ -213,13 +213,39 @@ describe("getCorrection", () => {
       const result = await getCorrection(TEXT);
 
       expect(askGemini).toHaveBeenCalledTimes(1);
+      // With a backup ready, the main model gets one try and 10 seconds to start writing.
       expect(askGemini).toHaveBeenCalledWith(TEXT, {
         model: "gemini-3.1-flash-lite",
         deadline: expect.any(AbortSignal),
+        tries: 1,
+        firstTextMs: 10_000,
       });
       expect(askClaude).not.toHaveBeenCalled();
       expect(askClaudeCode).not.toHaveBeenCalled();
       expect(result).toEqual(VALID);
+    });
+
+    it("gives the main model its usual tries and time when there is no backup", async () => {
+      vi.stubEnv("GEMINI_FALLBACK_MODEL", "none");
+      vi.mocked(askGemini).mockResolvedValue(VALID);
+
+      await getCorrection(TEXT);
+
+      expect(askGemini).toHaveBeenCalledWith(TEXT, {
+        model: "gemini-3.1-flash-lite",
+        deadline: expect.any(AbortSignal),
+      });
+    });
+
+    it("passes the pieces of the answer on as Gemini writes them", async () => {
+      vi.mocked(askGemini).mockResolvedValue(VALID);
+      const onText = vi.fn();
+      const onRestart = vi.fn();
+
+      await getCorrection(TEXT, { onText, onRestart });
+
+      expect(vi.mocked(askGemini).mock.calls[0][1]?.onText).toBe(onText);
+      expect(onRestart).not.toHaveBeenCalled();
     });
 
     it("uses GEMINI_MODEL as the main model", async () => {
@@ -259,6 +285,31 @@ describe("getCorrection", () => {
         const calls = vi.mocked(askGemini).mock.calls;
         expect(calls.map((call) => call[1]?.model)).toEqual(["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]);
         expect(calls[1][1]?.deadline).toBe(calls[0][1]?.deadline); // one shared deadline
+      });
+
+      it("tells the page to start again, and gives the backup its usual tries and time", async () => {
+        vi.spyOn(console, "warn").mockImplementation(() => {});
+        const order: string[] = [];
+        vi.mocked(askGemini)
+          .mockImplementationOnce(async () => {
+            order.push("main model");
+            throw new CorrectionError("AI_TIMEOUT", "No text from Gemini within 10000 ms");
+          })
+          .mockImplementationOnce(async () => {
+            order.push("backup model");
+            return VALID;
+          });
+        const onText = vi.fn();
+        const onRestart = vi.fn(() => order.push("restart"));
+
+        await expect(getCorrection(TEXT, { onText, onRestart })).resolves.toEqual(VALID);
+
+        expect(order).toEqual(["main model", "restart", "backup model"]);
+        expect(vi.mocked(askGemini).mock.calls[1][1]).toEqual({
+          model: "gemini-3.5-flash-lite",
+          deadline: expect.any(AbortSignal),
+          onText,
+        });
       });
 
       it("answers when the main model's answer fails the safety checks", async () => {

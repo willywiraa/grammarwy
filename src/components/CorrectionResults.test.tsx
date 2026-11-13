@@ -77,4 +77,31 @@ describe("CorrectionResults", () => {
       screen.queryByRole("heading", { name: "What was fixed and why" }),
     ).not.toBeInTheDocument();
   });
+
+  describe("while the AI is writing", () => {
+    const partial = { correctedText: "He goes to the office every day.", professionalVersion: "He goes to" };
+
+    it("shows the four cards with the text so far, and the cursor in the one being written", () => {
+      render(<CorrectionResults result={partial} writing />);
+
+      const headings = screen.getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent);
+      expect(headings).toEqual(["Corrected version", "Professional", "Natural / Casual", "Concise"]);
+      expect(card("Corrected version").getByText(partial.correctedText)).toBeInTheDocument();
+      expect(card("Corrected version").queryByTestId("writing-cursor")).not.toBeInTheDocument();
+      expect(card("Professional").getByText("He goes to")).toBeInTheDocument();
+      expect(card("Professional").getByTestId("writing-cursor")).toBeInTheDocument();
+      expect(card("Natural / Casual").getByTestId("text-placeholder")).toBeInTheDocument();
+      expect(card("Concise").getByTestId("text-placeholder")).toBeInTheDocument();
+    });
+
+    it("leaves out the Copy buttons, the notice and the explanations until the answer is complete", () => {
+      render(<CorrectionResults result={partial} writing />);
+
+      expect(screen.queryByRole("button")).not.toBeInTheDocument();
+      expect(screen.queryByText(NOTICE)).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("heading", { name: "What was fixed and why" }),
+      ).not.toBeInTheDocument();
+    });
+  });
 });

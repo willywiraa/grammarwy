@@ -89,7 +89,7 @@ In `.env.local`, set `USE_MOCK_AI=false`, then pick one:
 
 If you set up more than one, `AI_PROVIDER` picks which one the app uses.
 
-A short text takes a few seconds (about 10 with Claude Code). A long one, near the 5,000-character limit, can take up to a minute. When Google's free tier is busy, a Gemini answer can take a minute or two: the app sends a request again if it waits too long.
+With Gemini, the corrected text starts to appear after 1–3 seconds, and a short text is complete after 2–5 seconds. A long one, near the 5,000-character limit, takes longer to finish. If the main model writes nothing within 10 seconds, or its answer fails the app's checks, the backup model starts again, which adds a few seconds. Claude Code and the Anthropic API show the whole answer at once: with Claude Code, about 10 seconds for a short text and up to a minute for a long one.
 
 ## Settings
 
@@ -124,6 +124,8 @@ Online, every page and API request needs the site password. Your browser shows i
    - `GEMINI_API_KEY` for free corrections with Gemini, or
    - `ANTHROPIC_API_KEY` for Claude, billed per use.
 3. Deploy. Every push to `main` deploys again. After you change a setting, redeploy so it takes effect.
+
+The server code runs in Vercel's Singapore region (`sin1`), set in `vercel.json`. The Hobby plan runs it in one region, so if you're far from Singapore, change it to the [region](https://vercel.com/docs/regions) closest to you.
 
 No API key yet? Set `USE_MOCK_AI=true` instead, and the site shows sample answers. With an Anthropic key, set a monthly spend limit on the Billing page at [platform.claude.com](https://platform.claude.com).
 

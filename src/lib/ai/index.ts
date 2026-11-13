@@ -1,6 +1,6 @@
 import { askClaude, DEADLINE_MS } from "@/lib/ai/claude";
 import { askClaudeCode } from "@/lib/ai/claude-code";
-import { askGemini, readGeminiModels } from "@/lib/ai/gemini";
+import { askGemini, GEMINI_FIRST_TEXT_MS, readGeminiModels } from "@/lib/ai/gemini";
 import { getMockAnswer } from "@/lib/ai/mock";
 import { CorrectionError } from "@/lib/api-errors";
 import { CorrectionResultSchema, type CorrectionResult } from "@/lib/correction-schema";
@@ -20,16 +20,31 @@ const ASK: Record<AiProvider, (text: string) => Promise<unknown>> = {
 };
 
 /**
+ * What getCorrection reports while it works, so the page can show the answer
+ * as it is written. Only Gemini writes in pieces. The other connections, and
+ * mock mode, only return the final result.
+ */
+export type CorrectionProgress = {
+  /** Gets each new piece of the answer's JSON as soon as the AI writes it. */
+  onText?: (piece: string) => void;
+  /** The text written so far is dropped, because the backup model starts again. */
+  onRestart?: () => void;
+};
+
+/**
  * Corrects a text. It asks the AI, or the mock when USE_MOCK_AI=true, and
  * checks the answer before returning it. Throws a CorrectionError on failure.
  */
-export async function getCorrection(text: string): Promise<CorrectionResult> {
+export async function getCorrection(
+  text: string,
+  progress: CorrectionProgress = {},
+): Promise<CorrectionResult> {
   if (process.env.USE_MOCK_AI === "true") {
     return checkAnswer(await getMockAnswer(text), text);
   }
   const provider = readProvider();
   if (provider === "gemini") {
-    return correctWithGemini(text);
+    return correctWithGemini(text, progress);
   }
   const answer = await ASK[provider](text);
   return checkAnswer(answer, text);
@@ -40,18 +55,26 @@ export async function getCorrection(text: string): Promise<CorrectionResult> {
  * limit, no answer in time, or an answer that fails checkAnswer), the backup
  * model gets the same text. Both share one deadline, so the whole correction
  * still ends within DEADLINE_MS.
+ *
+ * With a backup ready, the main model gets one try, and must start writing
+ * within GEMINI_FIRST_TEXT_MS. A stuck request then costs seconds, not minutes.
  */
-async function correctWithGemini(text: string): Promise<CorrectionResult> {
+async function correctWithGemini(
+  text: string,
+  { onText, onRestart }: CorrectionProgress,
+): Promise<CorrectionResult> {
   const { primary, fallback } = readGeminiModels();
   const deadline = AbortSignal.timeout(DEADLINE_MS);
+  const quick = fallback ? { tries: 1, firstTextMs: GEMINI_FIRST_TEXT_MS } : {};
   try {
-    return checkAnswer(await askGemini(text, { model: primary, deadline }), text);
+    return checkAnswer(await askGemini(text, { model: primary, deadline, onText, ...quick }), text);
   } catch (error) {
     if (!fallback || deadline.aborted) throw error;
     // Only the error code and details, which never contain the text.
     const reason = error instanceof CorrectionError ? `${error.code}: ${error.message}` : "unknown error";
     console.warn(`[ai] ${primary} failed (${reason}); asking ${fallback}`);
-    return checkAnswer(await askGemini(text, { model: fallback, deadline }), text);
+    onRestart?.();
+    return checkAnswer(await askGemini(text, { model: fallback, deadline, onText }), text);
   }
 }
 

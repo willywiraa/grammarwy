@@ -35,5 +35,31 @@ describe("ResultCard", () => {
     render(<ResultCard title="Natural / Casual" text="Hey, thanks!" />);
 
     expect(screen.getByRole("button", { name: "Copy Natural / Casual" })).toBeInTheDocument();
+    expect(screen.queryByTestId("writing-cursor")).not.toBeInTheDocument();
+  });
+
+  describe("while the AI is writing", () => {
+    it("shows the text so far with a cursor, and no Copy button yet", () => {
+      render(<ResultCard title="Concise" text="Thanks for the" writing cursor />);
+
+      expect(screen.getByText("Thanks for the")).toBeInTheDocument();
+      expect(screen.getByTestId("writing-cursor")).toBeInTheDocument();
+      expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    });
+
+    it("shows a placeholder until the version starts", () => {
+      render(<ResultCard title="Concise" text="" writing />);
+
+      expect(screen.getByTestId("text-placeholder")).toBeInTheDocument();
+      expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    });
+
+    it("shows a finished version without a cursor", () => {
+      render(<ResultCard title="Corrected version" text="He goes to work." writing />);
+
+      expect(screen.getByText("He goes to work.")).toBeInTheDocument();
+      expect(screen.queryByTestId("writing-cursor")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("text-placeholder")).not.toBeInTheDocument();
+    });
   });
 });

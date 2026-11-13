@@ -5,6 +5,7 @@ import CorrectionResults from "@/components/CorrectionResults";
 import { requestCorrection } from "@/lib/api-client";
 import { API_ERRORS } from "@/lib/api-errors";
 import type { CorrectionResult } from "@/lib/correction-schema";
+import type { PartialAnswer } from "@/lib/correction-stream";
 import { checkText, MAX_INPUT_LENGTH } from "@/lib/validation";
 
 // Formats numbers the same way on the server and in the browser: 5000 → "5,000".
@@ -13,7 +14,10 @@ const numberFormat = new Intl.NumberFormat("en-US");
 /** What the page is doing right now. */
 type PageState =
   | { status: "idle" }
-  | { status: "loading" }
+  /** Waiting for the AI to start writing. `restarted`: the backup model starts again. */
+  | { status: "loading"; startedAt: number; restarted: boolean }
+  /** The AI is writing, and the versions fill in as the text arrives. */
+  | { status: "writing"; startedAt: number; answer: PartialAnswer }
   | { status: "success"; result: CorrectionResult }
   | { status: "error"; message: string };
 
@@ -23,17 +27,19 @@ export default function GrammarAssistant() {
   const [state, setState] = useState<PageState>({ status: "idle" });
   const resultsRef = useRef<HTMLDivElement>(null);
 
-  const loading = state.status === "loading";
+  const busy = state.status === "loading" || state.status === "writing";
   const overLimit = text.length > MAX_INPUT_LENGTH;
   // The same rules the server uses: not empty, not only spaces, not over the limit.
-  const canSubmit = checkText(text).ok && !loading;
+  const canSubmit = checkText(text).ok && !busy;
+  const showResults = state.status === "writing" || state.status === "success";
 
-  // Once new results are on the page, scroll down to them.
+  // Once results appear (the first text the AI writes, or a complete answer),
+  // scroll down to them.
   useEffect(() => {
-    if (state.status === "success") {
+    if (showResults) {
       resultsRef.current?.scrollIntoView({ block: "start" });
     }
-  }, [state]);
+  }, [showResults]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); // stops the browser from reloading the page
@@ -42,8 +48,12 @@ export default function GrammarAssistant() {
     if (!canSubmit) {
       return;
     }
-    setState({ status: "loading" });
-    const outcome = await requestCorrection(text);
+    const startedAt = Date.now();
+    setState({ status: "loading", startedAt, restarted: false });
+    const outcome = await requestCorrection(text, {
+      onPartial: (answer) => setState({ status: "writing", startedAt, answer }),
+      onRestart: () => setState({ status: "loading", startedAt, restarted: true }),
+    });
     setState(
       outcome.ok
         ? { status: "success", result: outcome.result }
@@ -94,14 +104,14 @@ export default function GrammarAssistant() {
             type="submit"
             aria-disabled={!canSubmit}
             className={`inline-flex items-center justify-center gap-2 rounded-lg px-5 py-2.5 font-medium shadow-xs focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 ${
-              loading
+              busy
                 ? "cursor-wait bg-blue-600 text-white"
                 : canSubmit
                   ? "cursor-pointer bg-blue-600 text-white hover:bg-blue-700 active:bg-blue-800"
                   : "cursor-not-allowed bg-zinc-200 text-zinc-500"
             }`}
           >
-            {loading ? (
+            {busy ? (
               <>
                 <Spinner />
                 Correcting…
@@ -130,16 +140,24 @@ export default function GrammarAssistant() {
         </div>
       )}
 
-      {/* Screen readers announce what happens here: first the waiting note, then "Done". */}
+      {/* Screen readers announce what happens here: first the waiting note,
+          then "Writing", then "Done". The text being written isn't read out
+          piece by piece: its area is marked busy until the answer is complete. */}
       <div role="status" className="mt-10">
-        {loading && (
-          <div className="rounded-xl border border-dashed border-zinc-300 px-5 py-8 text-center">
-            <p className="font-medium text-zinc-800">Correcting your text…</p>
-            <p className="mt-1 text-sm text-zinc-600">
-              This usually takes about 10 seconds. Long texts can take up to a minute.
+        {state.status === "loading" && (
+          <div className="rounded-xl border border-dashed border-zinc-300 px-5 pt-8 pb-3 text-center">
+            <p className="font-medium text-zinc-800">
+              {state.restarted ? "Getting an answer from the backup model…" : "Correcting your text…"}
             </p>
+            <p className="mt-1 text-sm text-zinc-600">
+              {state.restarted
+                ? "The first answer couldn't be used. This takes a few more seconds."
+                : "This usually takes 2–5 seconds."}
+            </p>
+            <ElapsedSeconds since={state.startedAt} />
           </div>
         )}
+        {state.status === "writing" && <p className="sr-only">Writing your corrected text…</p>}
         {state.status === "success" && (
           <p className="sr-only">
             {state.result.alreadyCorrect
@@ -149,12 +167,36 @@ export default function GrammarAssistant() {
         )}
       </div>
 
-      {state.status === "success" && (
-        <div ref={resultsRef} className="scroll-mt-6">
-          <CorrectionResults result={state.result} />
+      {showResults && (
+        <div ref={resultsRef} className="scroll-mt-6" aria-busy={state.status === "writing"}>
+          {state.status === "writing" ? (
+            <CorrectionResults result={state.answer} writing />
+          ) : (
+            state.status === "success" && <CorrectionResults result={state.result} />
+          )}
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * The seconds since `since`, counting up while you wait. It is left out for
+ * screen readers, which would otherwise announce every second.
+ */
+function ElapsedSeconds({ since }: { since: number }) {
+  const [now, setNow] = useState(since);
+
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const seconds = Math.floor((now - since) / 1000);
+  return (
+    <p aria-hidden="true" className="mt-2 min-h-5 text-sm tabular-nums text-zinc-500">
+      {seconds > 0 ? `${seconds} s` : ""}
+    </p>
   );
 }
 

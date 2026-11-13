@@ -14,13 +14,13 @@ import { SYSTEM_PROMPT } from "./prompt";
 // kept, so the code sees exactly what it would see in production.
 const fake = vi.hoisted(() => ({
   clientOptions: [] as unknown[],
-  generateContent: vi.fn(),
+  generateContentStream: vi.fn(),
 }));
 
 vi.mock("@google/genai", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@google/genai")>();
   class FakeGoogleGenAI {
-    models = { generateContent: fake.generateContent };
+    models = { generateContentStream: fake.generateContentStream };
     constructor(options: unknown) {
       fake.clientOptions.push(options);
     }
@@ -48,12 +48,33 @@ function reply(fields: Record<string, unknown> = {}): GenerateContentResponse {
   });
 }
 
-function answersWith(response: GenerateContentResponse) {
-  fake.generateContent.mockResolvedValue(response);
+/** A piece of a streamed answer, without a finish reason yet. */
+function piece(text: string): GenerateContentResponse {
+  return Object.assign(new GenerateContentResponse(), {
+    candidates: [{ content: { role: "model", parts: [{ text }] } }],
+  });
 }
 
+/** The pieces of a streamed answer, handed out the way the SDK does. */
+async function* streamOf(chunks: GenerateContentResponse[]) {
+  for (const chunk of chunks) {
+    yield chunk;
+  }
+}
+
+/** Makes the fake stream these chunks. A finished answer can come as one chunk. */
+function answersWith(...chunks: GenerateContentResponse[]) {
+  fake.generateContentStream.mockImplementation(async () => streamOf(chunks));
+}
+
+/** Makes the fake fail before the answer starts. */
 function failsWith(error: unknown) {
-  fake.generateContent.mockRejectedValue(error);
+  fake.generateContentStream.mockRejectedValue(error);
+}
+
+/** How the SDK reports a request it stopped because its signal was aborted. */
+function abortError() {
+  return new DOMException("This operation was aborted", "AbortError");
 }
 
 /** An error answer from the API, built the way the SDK builds it. */
@@ -87,7 +108,7 @@ async function failureDetails(): Promise<string> {
 }
 
 function sentParams() {
-  return fake.generateContent.mock.calls[0][0];
+  return fake.generateContentStream.mock.calls[0][0];
 }
 
 let consoleInfo: MockInstance<typeof console.info>;
@@ -95,7 +116,7 @@ let consoleInfo: MockInstance<typeof console.info>;
 beforeEach(() => {
   vi.stubEnv("GEMINI_API_KEY", KEY);
   fake.clientOptions.length = 0;
-  fake.generateContent.mockReset();
+  fake.generateContentStream.mockReset();
   answersWith(reply());
   consoleInfo = vi.spyOn(console, "info").mockImplementation(() => {});
 });
@@ -177,11 +198,17 @@ describe("askGemini", () => {
       });
     });
 
-    it("gives a long text more time per try, and leaves the backup model at least 100 seconds", () => {
+    it("gives a long text more time per try, and the main model's try and the backup's two fit within the deadline", () => {
       const longest = "x".repeat(MAX_INPUT_LENGTH);
 
       expect(geminiTryTimeoutMs(longest)).toBe(70_000);
-      expect(DEADLINE_MS - 2 * geminiTryTimeoutMs(longest)).toBeGreaterThanOrEqual(100_000);
+      expect(3 * geminiTryTimeoutMs(longest)).toBeLessThanOrEqual(DEADLINE_MS);
+    });
+
+    it("gives the model as many tries as it is asked to", async () => {
+      await askGemini(TEXT, { tries: 1 });
+
+      expect(fake.clientOptions[0]).toMatchObject({ httpOptions: { retryOptions: { attempts: 1 } } });
     });
 
     it("asks the model and uses the deadline it is given", async () => {
@@ -199,6 +226,75 @@ describe("askGemini", () => {
       await askGemini(TEXT);
 
       expect(sentParams().model).toBe("gemini-3.6-flash");
+    });
+  });
+
+  describe("streaming", () => {
+    const json = JSON.stringify(ANSWER);
+    const pieces = [json.slice(0, 20), json.slice(20, 90), json.slice(90)];
+
+    it("passes each piece of the answer to onText as it arrives, and returns the whole answer", async () => {
+      answersWith(piece(pieces[0]), piece(pieces[1]), reply({ candidates: [candidate(pieces[2])] }));
+      const onText = vi.fn();
+
+      await expect(askGemini(TEXT, { onText })).resolves.toEqual(ANSWER);
+
+      expect(onText.mock.calls.map(([text]) => text)).toEqual(pieces);
+    });
+
+    it("skips chunks without text, such as a last one with only the usage", async () => {
+      const usageOnly = reply({ candidates: [{ finishReason: FinishReason.STOP }] });
+      answersWith(piece(json), usageOnly);
+      const onText = vi.fn();
+
+      await expect(askGemini(TEXT, { onText })).resolves.toEqual(ANSWER);
+
+      expect(onText).toHaveBeenCalledTimes(1);
+      expect(consoleInfo.mock.calls[0][0]).toContain("finish=STOP in=1500 out=900");
+    });
+
+    it("gives up with AI_TIMEOUT when no text arrives within firstTextMs", async () => {
+      // Like the SDK, the fake stops when its signal is aborted.
+      fake.generateContentStream.mockImplementation(
+        ({ config }: { config: { abortSignal: AbortSignal } }) =>
+          new Promise((_resolve, reject) => {
+            config.abortSignal.addEventListener("abort", () => reject(abortError()));
+          }),
+      );
+
+      const error = await askGemini(TEXT, { firstTextMs: 20 }).catch((caught: unknown) => caught);
+
+      expect(error).toEqual(correctionError("AI_TIMEOUT"));
+      expect((error as Error).message).toBe("No text from Gemini within 20 ms");
+    });
+
+    it("lets an answer that started in time take longer than firstTextMs", async () => {
+      fake.generateContentStream.mockImplementation(
+        async ({ config }: { config: { abortSignal: AbortSignal } }) =>
+          (async function* () {
+            yield piece(pieces[0]);
+            await new Promise((resolve) => setTimeout(resolve, 60));
+            if (config.abortSignal.aborted) {
+              throw abortError();
+            }
+            yield reply({ candidates: [candidate(pieces[1] + pieces[2])] });
+          })(),
+      );
+
+      await expect(askGemini(TEXT, { firstTextMs: 20 })).resolves.toEqual(ANSWER);
+    });
+
+    it("reports a failure in the middle of the answer like any other", async () => {
+      fake.generateContentStream.mockImplementation(async () =>
+        (async function* () {
+          yield piece(pieces[0]);
+          throw networkError();
+        })(),
+      );
+      const onText = vi.fn();
+
+      await expect(askGemini(TEXT, { onText })).rejects.toThrow(correctionError("AI_ERROR"));
+      expect(onText).toHaveBeenCalledWith(pieces[0]);
     });
   });
 
@@ -227,7 +323,7 @@ describe("askGemini", () => {
 
       expect(details).toContain("GEMINI_API_KEY");
       await expect(askGemini(TEXT)).rejects.toThrow(correctionError("SERVER_CONFIG"));
-      expect(fake.generateContent).not.toHaveBeenCalled();
+      expect(fake.generateContentStream).not.toHaveBeenCalled();
     });
   });
 
@@ -364,7 +460,7 @@ describe("askGemini", () => {
 
       expect(consoleInfo).toHaveBeenCalledTimes(1);
       expect(consoleInfo.mock.calls[0][0]).toMatch(
-        /^\[ai\/gemini\] model=gemini-3.1-flash-lite finish=STOP in=1500 out=900 thoughts=200 ms=\d+ chars=27 request=resp_test$/,
+        /^\[ai\/gemini\] model=gemini-3.1-flash-lite finish=STOP in=1500 out=900 thoughts=200 first=\d+ ms=\d+ chars=27 request=resp_test$/,
       );
     });
 

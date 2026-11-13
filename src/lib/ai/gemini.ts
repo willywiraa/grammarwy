@@ -35,26 +35,40 @@ export const DEFAULT_GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite";
 /** Google's Gemini API. The key is only ever sent here. */
 export const GEMINI_API_URL = "https://generativelanguage.googleapis.com/";
 
-/** How much Gemini thinks before answering. Low is faster, and enough for grammar. */
+/**
+ * How much Gemini thinks before it starts writing. Low is fast, and enough for
+ * grammar. Minimal would start the answer a fraction of a second sooner, but
+ * in testing gemini-3.1-flash-lite then often joined the paragraphs of an
+ * email into one line, an answer the app has to reject and ask again.
+ */
 export const GEMINI_THINKING_LEVEL = ThinkingLevel.LOW;
 
 /** Room for thinking plus four versions of a 5,000-character text and the explanations. */
 export const GEMINI_MAX_TOKENS = 16_000;
 
 /**
- * How often one model may be tried: the first try and one more. After that the
- * backup model gets its turn. On the free tier every try, even a failed one,
- * counts toward the daily allowance.
+ * How often one model may be tried: the first try and one more. When a backup
+ * model is ready, the main model gets one try only (see getCorrection in
+ * index.ts), so the backup starts sooner. On the free tier every try, even a
+ * failed one, counts toward the daily allowance.
  */
 export const GEMINI_TRIES = 2;
 
 /**
- * How long one try may take: 30 seconds, plus 8 more for every 1,000
- * characters, so a long answer has time to be written (30–70 seconds). The
- * Flash-Lite models answered every test text within 15 seconds. Google's free
- * tier sometimes leaves a request waiting for minutes; such a try is stopped,
- * so the backup model still has time. Two tries of the main model leave at
- * least 100 seconds of DEADLINE_MS for the backup.
+ * How long the main model may take to start writing when a backup model is
+ * ready. The answer usually starts within 1–4 seconds. With no text after 10
+ * seconds, the request is most likely stuck at Google, so the backup is asked
+ * instead.
+ */
+export const GEMINI_FIRST_TEXT_MS = 10_000;
+
+/**
+ * How long one try may take, including the time the answer takes to stream
+ * in: 30 seconds, plus 8 more for every 1,000 characters, so a long answer has
+ * time to be written (30–70 seconds). Our test texts were all answered within
+ * 25 seconds. Google's free tier sometimes leaves a request waiting for
+ * minutes; such a try is stopped, so the backup model still has time. The main
+ * model's one try and the backup's two fit within DEADLINE_MS.
  */
 export function geminiTryTimeoutMs(text: string): number {
   return 30_000 + text.length * 8;
@@ -82,14 +96,38 @@ export function readGeminiModels(): { primary: string; fallback: string | null }
   return { primary, fallback };
 }
 
-/** Which model to ask, and a deadline shared with other calls for the same correction. */
-export type GeminiOptions = { model?: string; deadline?: AbortSignal };
+/** Settings for one call. All of them are optional. */
+export type GeminiOptions = {
+  /** The model to ask. Default: the main model (readGeminiModels). */
+  model?: string;
+  /** A deadline shared with other calls for the same correction. */
+  deadline?: AbortSignal;
+  /** How many tries the model gets. Default: GEMINI_TRIES. */
+  tries?: number;
+  /** Gives up when no text has arrived this many milliseconds after the start. */
+  firstTextMs?: number;
+  /** Gets each new piece of the answer's JSON as soon as Gemini writes it. */
+  onText?: (piece: string) => void;
+};
+
+/** What a call collects while the answer streams in. */
+type StreamedAnswer = {
+  json: string;
+  firstTextMs?: number;
+  blockReason?: string;
+  finishReason?: string;
+  usage?: GenerateContentResponse["usageMetadata"];
+  modelVersion?: string;
+  responseId?: string;
+};
 
 /**
  * Asks Gemini to correct a text and returns its answer as parsed JSON, like
- * askClaude does. The answer is `unknown` until `checkAnswer`
- * (lib/ai/index.ts) has checked it. Every failure is thrown as a
- * CorrectionError whose details never contain the user's text or the API key.
+ * askClaude does. The answer streams in: `onText` gets each piece as it
+ * arrives, so the page can show the text while Gemini is still writing. The
+ * answer is `unknown` until `checkAnswer` (lib/ai/index.ts) has checked it.
+ * Every failure is thrown as a CorrectionError whose details never contain
+ * the user's text or the API key.
  */
 export async function askGemini(text: string, options: GeminiOptions = {}): Promise<unknown> {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
@@ -107,19 +145,27 @@ export async function askGemini(text: string, options: GeminiOptions = {}): Prom
     httpOptions: {
       baseUrl: GEMINI_API_URL,
       // A try that takes too long, or that meets a temporary server problem
-      // (408, 500, 502, 503, 504), is sent once more. A 429 (a free-tier limit)
-      // isn't retried: trying again at once won't help, so the backup model is
-      // asked instead (getCorrection in index.ts).
+      // (408, 500, 502, 503, 504) before the answer starts, is sent once more.
+      // A 429 (a free-tier limit) isn't retried: trying again at once won't
+      // help, so the backup model is asked instead (getCorrection in index.ts).
       timeout: geminiTryTimeoutMs(text),
-      retryOptions: { attempts: GEMINI_TRIES, httpStatusCodes: [408, 500, 502, 503, 504] },
+      retryOptions: {
+        attempts: options.tries ?? GEMINI_TRIES,
+        httpStatusCodes: [408, 500, 502, 503, 504],
+      },
     },
   });
   const deadline = options.deadline ?? AbortSignal.timeout(DEADLINE_MS);
+  // Stops the call when no text has arrived in time (firstTextMs).
+  const noText = new AbortController();
+  const noTextTimer =
+    options.firstTextMs === undefined ? undefined : setTimeout(() => noText.abort(), options.firstTextMs);
+  const signal = noTextTimer === undefined ? deadline : AbortSignal.any([deadline, noText.signal]);
   const started = Date.now();
+  const answer: StreamedAnswer = { json: "" };
 
-  let response: GenerateContentResponse;
   try {
-    response = await client.models.generateContent({
+    const stream = await client.models.generateContentStream({
       model,
       contents: buildUserMessage(text),
       config: {
@@ -129,25 +175,57 @@ export async function askGemini(text: string, options: GeminiOptions = {}): Prom
         responseJsonSchema: ANSWER_JSON_SCHEMA,
         maxOutputTokens: GEMINI_MAX_TOKENS,
         thinkingConfig: { thinkingLevel: GEMINI_THINKING_LEVEL },
-        abortSignal: deadline,
+        abortSignal: signal,
       },
     });
+    for await (const chunk of stream) {
+      const piece = collect(chunk, answer);
+      if (!piece) {
+        continue;
+      }
+      if (answer.firstTextMs === undefined) {
+        answer.firstTextMs = Date.now() - started;
+        clearTimeout(noTextTimer);
+      }
+      answer.json += piece;
+      options.onText?.(piece);
+    }
   } catch (error) {
-    throw toCorrectionError(error, deadline, Date.now() - started);
+    throw toCorrectionError(error, {
+      deadline,
+      noText: noText.signal,
+      firstTextMs: options.firstTextMs,
+      ms: Date.now() - started,
+    });
+  } finally {
+    clearTimeout(noTextTimer);
   }
 
-  logCall(response, { model, ms: Date.now() - started, chars: text.length });
-  return readAnswer(response);
+  logCall(answer, { model, ms: Date.now() - started, chars: text.length });
+  return readAnswer(answer);
+}
+
+/**
+ * Notes a streamed chunk's details and returns its text. `text` joins the
+ * chunk's text parts and skips Gemini's thinking. Each chunk's usage is the
+ * running total, so the last one counts.
+ */
+function collect(chunk: GenerateContentResponse, answer: StreamedAnswer): string {
+  answer.blockReason = chunk.promptFeedback?.blockReason ?? answer.blockReason;
+  answer.finishReason = chunk.candidates?.[0]?.finishReason ?? answer.finishReason;
+  answer.usage = chunk.usageMetadata ?? answer.usage;
+  answer.modelVersion = chunk.modelVersion ?? answer.modelVersion;
+  answer.responseId = chunk.responseId ?? answer.responseId;
+  return chunk.text ?? "";
 }
 
 /** Checks why Gemini stopped, then reads its JSON answer. */
-function readAnswer(response: GenerateContentResponse): unknown {
+function readAnswer(answer: StreamedAnswer): unknown {
   // Only the reasons are logged. Google's explanation could describe the text.
-  const blockReason = response.promptFeedback?.blockReason;
+  const { blockReason, finishReason, json } = answer;
   if (blockReason) {
     throw new CorrectionError("AI_REFUSED", `Gemini declined the text (block reason: ${blockReason})`);
   }
-  const finishReason = response.candidates?.[0]?.finishReason;
   if (finishReason === FinishReason.MAX_TOKENS) {
     throw new CorrectionError("AI_INCOMPLETE", "The answer was cut off (finish reason: MAX_TOKENS)");
   }
@@ -158,8 +236,6 @@ function readAnswer(response: GenerateContentResponse): unknown {
     throw new CorrectionError("AI_ERROR", `Gemini stopped early (finish reason: ${finishReason})`);
   }
 
-  // `text` joins the answer's text parts and skips Gemini's thinking.
-  const json = response.text ?? "";
   if (json.trim() === "") {
     throw new CorrectionError("AI_ERROR", "The answer had no text");
   }
@@ -172,13 +248,20 @@ function readAnswer(response: GenerateContentResponse): unknown {
   }
 }
 
-/** Turns anything the SDK throws into one of our error codes. */
-function toCorrectionError(error: unknown, deadline: AbortSignal, ms: number): CorrectionError {
-  const after = `after ${ms} ms`;
+/** What toCorrectionError needs to know about the call. */
+type CallInfo = { deadline: AbortSignal; noText: AbortSignal; firstTextMs?: number; ms: number };
 
+/** Turns anything the SDK throws into one of our error codes. */
+function toCorrectionError(error: unknown, call: CallInfo): CorrectionError {
+  const after = `after ${call.ms} ms`;
+
+  // No text arrived within firstTextMs, so the backup model takes over.
+  if (call.noText.aborted && !call.deadline.aborted) {
+    return new CorrectionError("AI_TIMEOUT", `No text from Gemini within ${call.firstTextMs} ms`);
+  }
   // Our own deadline (DEADLINE_MS) stopped the request, or every try ran out
   // of time. The SDK's retry helper notes the number of the last try.
-  if (deadline.aborted || (error instanceof Error && error.name === "AbortError")) {
+  if (call.deadline.aborted || (error instanceof Error && error.name === "AbortError")) {
     const tries = (error as { attemptNumber?: number } | null | undefined)?.attemptNumber;
     return new CorrectionError("AI_TIMEOUT", `No complete answer from Gemini ${after}${tries ? ` (${tries} tries)` : ""}`);
   }
@@ -226,21 +309,24 @@ function describeApiError(error: ApiError): string {
   return [`Gemini API error ${error.status}`, status, message.slice(0, 200)].filter(Boolean).join(", ");
 }
 
-/** One line per answer, with metadata only: never the text or the key. */
-function logCall(response: GenerateContentResponse, call: { model: string; ms: number; chars: number }): void {
-  const usage = response.usageMetadata;
-  const finish = response.candidates?.[0]?.finishReason ?? response.promptFeedback?.blockReason ?? "none";
+/**
+ * One line per answer, with metadata only: never the text or the key.
+ * `first` is how long the first text took to arrive, and `ms` the whole answer.
+ */
+function logCall(answer: StreamedAnswer, call: { model: string; ms: number; chars: number }): void {
+  const usage = answer.usage;
   console.info(
     [
       "[ai/gemini]",
-      `model=${response.modelVersion ?? call.model}`,
-      `finish=${finish}`,
+      `model=${answer.modelVersion ?? call.model}`,
+      `finish=${answer.finishReason ?? answer.blockReason ?? "none"}`,
       `in=${usage?.promptTokenCount ?? 0}`,
       `out=${usage?.candidatesTokenCount ?? 0}`,
       `thoughts=${usage?.thoughtsTokenCount ?? 0}`,
+      `first=${answer.firstTextMs ?? "none"}`,
       `ms=${call.ms}`,
       `chars=${call.chars}`,
-      `request=${response.responseId ?? "unknown"}`,
+      `request=${answer.responseId ?? "unknown"}`,
     ].join(" "),
   );
 }

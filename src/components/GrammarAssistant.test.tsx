@@ -1,8 +1,9 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NETWORK_ERROR_MESSAGE } from "@/lib/api-client";
 import { API_ERRORS } from "@/lib/api-errors";
+import type { StreamEvent } from "@/lib/correction-stream";
 import { SAMPLE_ALREADY_CORRECT, SAMPLE_WITH_FIXES } from "@/lib/sample-results";
 import GrammarAssistant from "./GrammarAssistant";
 
@@ -15,6 +16,27 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+/** A pretend live answer. The test sends each event when it wants. */
+function liveResponse() {
+  const encoder = new TextEncoder();
+  let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      stream = controller;
+    },
+  });
+  return {
+    response: new Response(body, { headers: { "Content-Type": "application/x-ndjson" } }),
+    /** Sends one event, as the server does while the AI writes. */
+    send: async (event: StreamEvent) => {
+      await act(async () => {
+        stream?.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
+      });
+    },
+    end: () => stream?.close(),
+  };
 }
 
 /** Shows the component and returns what most tests need. */
@@ -36,6 +58,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -193,6 +216,93 @@ describe("GrammarAssistant", () => {
       await user.click(mainButton());
 
       expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("shows the versions while the AI writes them, then the complete answer", async () => {
+      const live = liveResponse();
+      fetchMock.mockResolvedValue(live.response);
+      const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+      const { user, textArea } = setup();
+
+      await user.type(textArea, "He go to office every days.");
+      await user.click(mainButton());
+      expect(screen.getByRole("status")).toHaveTextContent("Correcting your text…");
+      expect(scrollIntoView).not.toHaveBeenCalled();
+
+      // The first text appears, and the page scrolls to it.
+      await live.send({ type: "text", text: '{"correctedText": "He goes to the off' });
+      const written = await screen.findByText("He goes to the off");
+      expect(written.closest("[aria-busy]")).toHaveAttribute("aria-busy", "true");
+      expect(screen.getByRole("status")).toHaveTextContent("Writing your corrected text…");
+      expect(screen.queryByRole("button", { name: /^Copy/ })).not.toBeInTheDocument();
+      expect(mainButton()).toHaveAccessibleName("Correcting…");
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
+
+      await live.send({ type: "done", result: SAMPLE_WITH_FIXES.result });
+      live.end();
+
+      expect(await screen.findByRole("button", { name: "Copy Corrected version" })).toBeInTheDocument();
+      expect(screen.getByText(SAMPLE_WITH_FIXES.result.correctedText)).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "What was fixed and why" })).toBeInTheDocument();
+      expect(screen.getByRole("status")).toHaveTextContent("Done. Your corrected text is below.");
+      expect(mainButton()).toHaveAccessibleName("Correct My Grammar");
+      // It doesn't scroll again when the answer is complete.
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    });
+
+    it("says when the backup model takes over, and drops what the first model wrote", async () => {
+      const live = liveResponse();
+      fetchMock.mockResolvedValue(live.response);
+      const { user, textArea } = setup();
+      await user.type(textArea, "Hello");
+      await user.click(mainButton());
+
+      await live.send({ type: "text", text: '{"correctedText": "First try' });
+      expect(await screen.findByText("First try")).toBeInTheDocument();
+      await live.send({ type: "restart" });
+
+      expect(await screen.findByText("Getting an answer from the backup model…")).toBeInTheDocument();
+      expect(screen.queryByText("First try")).not.toBeInTheDocument();
+
+      await live.send({ type: "done", result: SAMPLE_WITH_FIXES.result });
+      live.end();
+      expect(await screen.findByText(SAMPLE_WITH_FIXES.result.correctedText)).toBeInTheDocument();
+    });
+
+    it("shows the error and clears the text written so far when the correction fails", async () => {
+      const live = liveResponse();
+      fetchMock.mockResolvedValue(live.response);
+      const { user, textArea } = setup();
+      await user.type(textArea, "Hello");
+      await user.click(mainButton());
+
+      await live.send({ type: "text", text: '{"correctedText": "Half an ans' });
+      expect(await screen.findByText("Half an ans")).toBeInTheDocument();
+      const { message } = API_ERRORS.AI_TIMEOUT;
+      await live.send({ type: "error", error: { code: "AI_TIMEOUT", message } });
+      live.end();
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(message);
+      expect(screen.queryByText("Half an ans")).not.toBeInTheDocument();
+      expect(mainButton()).toHaveAttribute("aria-disabled", "false");
+    });
+
+    it("counts the seconds while it waits for the first text", async () => {
+      fetchMock.mockReturnValue(new Promise(() => {}));
+      const { user, textArea } = setup();
+      await user.type(textArea, "Hello");
+      // A pretend clock from here on, so the test doesn't have to wait 3 seconds.
+      vi.useFakeTimers();
+      act(() => {
+        mainButton().click();
+      });
+
+      expect(screen.getByRole("status")).toHaveTextContent("This usually takes 2–5 seconds.");
+      act(() => {
+        vi.advanceTimersByTime(3_000);
+      });
+
+      expect(screen.getByText("3 s")).toBeInTheDocument();
     });
 
     it("keeps keyboard focus on the button while it is correcting", async () => {

@@ -1,12 +1,20 @@
 // @vitest-environment node
 import { APIError, APIUserAbortError } from "@anthropic-ai/sdk";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
-import { API_ERRORS, type ApiErrorCode } from "@/lib/api-errors";
+import { askGemini } from "@/lib/ai/gemini";
+import { API_ERRORS, CorrectionError, type ApiErrorCode } from "@/lib/api-errors";
 import { SAMPLE_WITH_FIXES } from "@/lib/sample-results";
 import { POST } from "./route";
 
 // The mock AI's pause is skipped, so the tests run instantly.
 vi.mock("@/lib/wait", () => ({ wait: vi.fn(async () => {}) }));
+
+// A fake Gemini call for the live answer's tests. gemini.test.ts covers the
+// Gemini code itself.
+vi.mock("@/lib/ai/gemini", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/ai/gemini")>()),
+  askGemini: vi.fn(),
+}));
 
 // A fake Anthropic client for the tests with mock mode off, so they never
 // call the real API. claude.test.ts covers the Claude code in detail.
@@ -233,6 +241,138 @@ describe("POST /api/correct", () => {
       // The details are in the server log instead.
       const logged = consoleError.mock.calls.flat().map(String).join("\n");
       expect(logged).toContain("invalid x-api-key");
+    });
+  });
+
+  describe("the live answer (Accept: application/x-ndjson)", () => {
+    const ANSWER_JSON = JSON.stringify(SAMPLE_WITH_FIXES.result);
+    const PIECES = [ANSWER_JSON.slice(0, 30), ANSWER_JSON.slice(30)];
+
+    /** Sends a request that asks for the live answer, the way the page does. */
+    function postLive(body: unknown, accept = "application/x-ndjson, application/json"): Promise<Response> {
+      return POST(
+        new Request("http://localhost/api/correct", {
+          method: "POST",
+          headers: { "content-type": "application/json", accept },
+          body: JSON.stringify(body),
+        }),
+      );
+    }
+
+    /** The events of a live answer, one per line. */
+    async function events(response: Response): Promise<unknown[]> {
+      const text = await response.text();
+      expect(text.endsWith("\n")).toBe(true);
+      return text.trimEnd().split("\n").map((line) => JSON.parse(line));
+    }
+
+    /** Makes the fake Gemini write these pieces, then answer with the whole answer. */
+    function geminiWrites(pieces: string[]) {
+      vi.mocked(askGemini).mockImplementationOnce(async (_text, options) => {
+        for (const piece of pieces) {
+          options?.onText?.(piece);
+        }
+        return JSON.parse(pieces.join(""));
+      });
+    }
+
+    beforeEach(() => {
+      vi.stubEnv("USE_MOCK_AI", "false");
+      vi.stubEnv("AI_PROVIDER", "gemini");
+      vi.mocked(askGemini).mockReset();
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+    });
+
+    it("sends the pieces of the answer as Gemini writes them, then the checked result", async () => {
+      geminiWrites(PIECES);
+
+      const response = await postLive({ text: "He go to office every days." });
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toBe("application/x-ndjson; charset=utf-8");
+      expect(response.headers.get("cache-control")).toBe("no-store, no-transform");
+      expect(await events(response)).toEqual([
+        { type: "text", text: PIECES[0] },
+        { type: "text", text: PIECES[1] },
+        { type: "done", result: SAMPLE_WITH_FIXES.result },
+      ]);
+    });
+
+    it("finds the live answer's type among the other accepted types", async () => {
+      geminiWrites(PIECES);
+
+      const response = await postLive({ text: "Hello" }, "application/json;q=0.9, Application/X-NDJSON");
+
+      expect(response.headers.get("content-type")).toBe("application/x-ndjson; charset=utf-8");
+    });
+
+    it("says when the backup model starts again", async () => {
+      vi.mocked(askGemini).mockImplementationOnce(async (_text, options) => {
+        options?.onText?.(PIECES[0]);
+        throw new CorrectionError("AI_ERROR", "The AI answer lost the line breaks of the text");
+      });
+      geminiWrites(PIECES);
+
+      const response = await postLive({ text: "Hello" });
+
+      expect(await events(response)).toEqual([
+        { type: "text", text: PIECES[0] },
+        { type: "restart" },
+        { type: "text", text: PIECES[0] },
+        { type: "text", text: PIECES[1] },
+        { type: "done", result: SAMPLE_WITH_FIXES.result },
+      ]);
+    });
+
+    it("ends with an error event that has only the friendly message", async () => {
+      vi.mocked(askGemini)
+        .mockRejectedValueOnce(new CorrectionError("RATE_LIMITED", "429 daily limit"))
+        .mockRejectedValueOnce(new CorrectionError("AI_TIMEOUT", "No complete answer from Gemini after 70000 ms"));
+
+      const response = await postLive({ text: "Hello" });
+
+      const answer = await events(response);
+      expect(answer).toEqual([{ type: "restart" }, { type: "error", ...errorBody("AI_TIMEOUT") }]);
+      expect(JSON.stringify(answer)).not.toContain("70000");
+      const logged = consoleError.mock.calls.flat().map(String).join("\n");
+      expect(logged).toContain("AI_TIMEOUT: No complete answer from Gemini after 70000 ms");
+    });
+
+    it("sends just the result when the AI doesn't write in pieces (mock mode)", async () => {
+      vi.stubEnv("USE_MOCK_AI", "true");
+
+      const response = await postLive({ text: "He go to office every days." });
+
+      expect(await events(response)).toEqual([{ type: "done", result: SAMPLE_WITH_FIXES.result }]);
+    });
+
+    it("answers a request that fails the checks with a JSON error and its status", async () => {
+      const response = await postLive({ text: "   " });
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual(errorBody("EMPTY_TEXT"));
+      expect(askGemini).not.toHaveBeenCalled();
+    });
+
+    it("stops sending, without an error, when the browser stops reading", async () => {
+      let finish: () => void = () => {};
+      vi.mocked(askGemini).mockImplementationOnce(async (_text, options) => {
+        options?.onText?.(PIECES[0]);
+        await new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        options?.onText?.(PIECES[1]);
+        return SAMPLE_WITH_FIXES.result;
+      });
+
+      const response = await postLive({ text: "Hello" });
+      const reader = response.body!.getReader();
+      await reader.read(); // the first piece
+      await reader.cancel(); // the page was closed
+      finish();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(consoleError).not.toHaveBeenCalled();
     });
   });
 
