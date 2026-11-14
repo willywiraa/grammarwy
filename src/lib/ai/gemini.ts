@@ -266,7 +266,15 @@ function toCorrectionError(error: unknown, call: CallInfo): CorrectionError {
     return new CorrectionError("AI_TIMEOUT", `No complete answer from Gemini ${after}${tries ? ` (${tries} tries)` : ""}`);
   }
   if (error instanceof ApiError) {
-    return new CorrectionError(codeForStatus(error.status), `${describeApiError(error)}, ${after}`);
+    const details = `${describeApiError(error)}, ${after}`;
+    const quota = error.status === 429 ? readQuota(error) : undefined;
+    if (quota?.daily) {
+      const retry = quota.retryAfter
+        ? { retryAfter: quota.retryAfter, resetAt: new Date(Date.now() + quota.retryAfter * 1000).toISOString() }
+        : undefined;
+      return new CorrectionError("AI_DAILY_LIMIT", `${details}, daily allowance used up`, retry);
+    }
+    return new CorrectionError(codeForStatus(error.status), details);
   }
   // Only the error's name and system code, such as "TypeError (ECONNRESET)":
   // other messages could quote the answer, which contains the user's text.
@@ -289,6 +297,34 @@ function codeForStatus(status: number): ApiErrorCode {
     return "SERVER_CONFIG";
   }
   return "AI_ERROR";
+}
+
+/**
+ * Reads a 429's details: whether it was a daily allowance that ran out (its
+ * quota id contains "PerDay", for example
+ * "GenerateRequestsPerDayPerProjectPerModel-FreeTier") rather than the limit
+ * per minute, and how many seconds until it comes back ("retryDelay":
+ * "20164s", which points at midnight Pacific time).
+ */
+function readQuota(error: ApiError): { daily: boolean; retryAfter?: number } {
+  let details: unknown;
+  try {
+    details = (JSON.parse(error.message) as { error?: { details?: unknown } }).error?.details;
+  } catch {
+    return { daily: false };
+  }
+  if (!Array.isArray(details)) {
+    return { daily: false };
+  }
+  const items = details.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null);
+  const daily = items.some(
+    (item) =>
+      Array.isArray(item.violations) &&
+      item.violations.some((violation) => /PerDay/i.test(String((violation as { quotaId?: unknown })?.quotaId ?? ""))),
+  );
+  const delay = items.map((item) => item.retryDelay).find((value) => typeof value === "string");
+  const seconds = typeof delay === "string" ? Math.ceil(Number.parseFloat(delay)) : Number.NaN;
+  return { daily, retryAfter: Number.isFinite(seconds) && seconds > 0 ? seconds : undefined };
 }
 
 /**

@@ -39,7 +39,7 @@ export async function getCorrection(
   text: string,
   progress: CorrectionProgress = {},
 ): Promise<CorrectionResult> {
-  if (process.env.USE_MOCK_AI === "true") {
+  if (isMockMode()) {
     return checkAnswer(await getMockAnswer(text), text);
   }
   const provider = readProvider();
@@ -48,6 +48,11 @@ export async function getCorrection(
   }
   const answer = await ASK[provider](text);
   return checkAnswer(answer, text);
+}
+
+/** True when USE_MOCK_AI=true: sample answers instead of the AI, and nothing is counted. */
+export function isMockMode(): boolean {
+  return process.env.USE_MOCK_AI === "true";
 }
 
 /**

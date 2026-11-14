@@ -2,10 +2,11 @@
 
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import CorrectionResults from "@/components/CorrectionResults";
-import { requestCorrection } from "@/lib/api-client";
+import { fetchUsage, requestCorrection } from "@/lib/api-client";
 import { API_ERRORS } from "@/lib/api-errors";
 import type { CorrectionResult } from "@/lib/correction-schema";
 import type { PartialAnswer } from "@/lib/correction-stream";
+import { describeUsage, type DailyUsage } from "@/lib/usage";
 import { checkText, MAX_INPUT_LENGTH } from "@/lib/validation";
 
 // Formats numbers the same way on the server and in the browser: 5000 → "5,000".
@@ -25,6 +26,8 @@ type PageState =
 export default function GrammarAssistant() {
   const [text, setText] = useState("");
   const [state, setState] = useState<PageState>({ status: "idle" });
+  // Today's count of corrections. Null when the site doesn't count them.
+  const [usage, setUsage] = useState<DailyUsage | null>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
 
   const busy = state.status === "loading" || state.status === "writing";
@@ -41,6 +44,20 @@ export default function GrammarAssistant() {
     }
   }, [showResults]);
 
+  // When the page opens, ask how many corrections are left today. A count
+  // from a correction that finished first is newer, so it is kept.
+  useEffect(() => {
+    let active = true;
+    fetchUsage().then((count) => {
+      if (active) {
+        setUsage((current) => current ?? count);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); // stops the browser from reloading the page
     // The button is disabled in these cases, but Ctrl + Enter needs the same guard.
@@ -54,6 +71,9 @@ export default function GrammarAssistant() {
       onPartial: (answer) => setState({ status: "writing", startedAt, answer }),
       onRestart: () => setState({ status: "loading", startedAt, restarted: true }),
     });
+    if (outcome.usage) {
+      setUsage(outcome.usage);
+    }
     setState(
       outcome.ok
         ? { status: "success", result: outcome.result }
@@ -128,6 +148,7 @@ export default function GrammarAssistant() {
             <span className="sr-only">characters</span>
           </p>
         </div>
+        {usage && <p className="mt-2 text-sm text-zinc-600">{describeUsage(usage)}</p>}
       </form>
 
       {state.status === "error" && (

@@ -1,11 +1,19 @@
 import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { NETWORK_ERROR_MESSAGE } from "@/lib/api-client";
+import { fetchUsage, NETWORK_ERROR_MESSAGE } from "@/lib/api-client";
 import { API_ERRORS } from "@/lib/api-errors";
 import type { StreamEvent } from "@/lib/correction-stream";
 import { SAMPLE_ALREADY_CORRECT, SAMPLE_WITH_FIXES } from "@/lib/sample-results";
+import { usageHeaders } from "@/lib/usage";
 import GrammarAssistant from "./GrammarAssistant";
+
+// Today's count, which the page asks for when it opens. A fake here, so fetch
+// below only ever sees the corrections. api-client.test.ts covers the real one.
+vi.mock("@/lib/api-client", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/api-client")>()),
+  fetchUsage: vi.fn(),
+}));
 
 // The tests replace the browser's fetch, so no real requests are sent.
 const fetchMock = vi.fn<typeof fetch>();
@@ -55,6 +63,8 @@ function mainButton() {
 beforeEach(() => {
   fetchMock.mockReset();
   vi.stubGlobal("fetch", fetchMock);
+  // By default the site doesn't count corrections, so no count is shown.
+  vi.mocked(fetchUsage).mockReset().mockResolvedValue(null);
 });
 
 afterEach(() => {
@@ -348,6 +358,74 @@ describe("GrammarAssistant", () => {
       await user.click(mainButton());
 
       expect(await screen.findByRole("alert")).toHaveTextContent(NETWORK_ERROR_MESSAGE);
+    });
+  });
+
+  describe("today's count", () => {
+    const USAGE = { limit: 100, remaining: 87, resetAt: "2026-11-15T00:00:00.000Z" };
+
+    it("shows how many corrections are left today when the page opens", async () => {
+      vi.mocked(fetchUsage).mockResolvedValue(USAGE);
+      setup();
+      expect(await screen.findByText("87 of 100 corrections left today")).toBeInTheDocument();
+    });
+
+    it("shows no count when the site doesn't count corrections", async () => {
+      setup();
+      await act(async () => {}); // let the page's question about the count finish
+      expect(fetchUsage).toHaveBeenCalledOnce();
+      expect(screen.queryByText(/corrections left today/)).not.toBeInTheDocument();
+    });
+
+    it("updates the count after each correction", async () => {
+      vi.mocked(fetchUsage).mockResolvedValue(USAGE);
+      fetchMock.mockResolvedValueOnce(
+        new Response(JSON.stringify(SAMPLE_WITH_FIXES.result), {
+          headers: { "Content-Type": "application/json", ...usageHeaders({ ...USAGE, remaining: 86 }) },
+        }),
+      );
+      const { user, textArea } = setup();
+      await screen.findByText("87 of 100 corrections left today");
+
+      await user.type(textArea, "He go to office every days.");
+      await user.click(mainButton());
+
+      expect(await screen.findByText("86 of 100 corrections left today")).toBeInTheDocument();
+    });
+
+    it("says when more corrections are possible once none are left", async () => {
+      vi.mocked(fetchUsage).mockResolvedValue({ ...USAGE, remaining: 0 });
+      setup();
+      expect(
+        await screen.findByText(/^No corrections left today\. You can correct more from .+\.$/),
+      ).toBeInTheDocument();
+    });
+
+    it("shows how long to wait once the limit per minute is reached", async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse(
+          {
+            error: {
+              code: "LIMIT_REACHED",
+              message: API_ERRORS.LIMIT_REACHED.message,
+              period: "minute",
+              limit: 10,
+              retryAfter: 20,
+              resetAt: "2026-11-14T03:26:00.000Z",
+            },
+          },
+          429,
+        ),
+      );
+      const { user, textArea } = setup();
+
+      await user.type(textArea, "Hello");
+      await user.click(mainButton());
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "Too many corrections in one minute. Please wait 20 seconds.",
+      );
+      expect(textArea).toHaveValue("Hello");
     });
   });
 });

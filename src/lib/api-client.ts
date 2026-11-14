@@ -1,4 +1,4 @@
-import { API_ERRORS, type ApiErrorBody } from "@/lib/api-errors";
+import { API_ERRORS } from "@/lib/api-errors";
 import { CorrectionResultSchema, type CorrectionResult } from "@/lib/correction-schema";
 import {
   readPartialAnswer,
@@ -6,6 +6,14 @@ import {
   VERSION_FIELDS,
   type PartialAnswer,
 } from "@/lib/correction-stream";
+import {
+  formatCount,
+  formatResetTime,
+  parseUsage,
+  readUsageHeaders,
+  type DailyUsage,
+  type TimeFormat,
+} from "@/lib/usage";
 
 /** Shown when the request can't reach the server at all. */
 export const NETWORK_ERROR_MESSAGE =
@@ -14,10 +22,13 @@ export const NETWORK_ERROR_MESSAGE =
 /** Shown when the answer stops before it is complete, for example when the connection breaks. */
 export const ANSWER_STOPPED_MESSAGE = "The answer stopped before it was complete. Please try again.";
 
-/** What the page gets back: the result, or a friendly message to show as it is. */
+/**
+ * What the page gets back: the result, or a friendly message to show as it is.
+ * `usage` is today's count after this correction, when the site counts them.
+ */
 export type CorrectionOutcome =
-  | { ok: true; result: CorrectionResult }
-  | { ok: false; message: string };
+  | { ok: true; result: CorrectionResult; usage?: DailyUsage }
+  | { ok: false; message: string; usage?: DailyUsage };
 
 /** What the page hears while the AI is writing. Both are optional. */
 export type CorrectionEvents = {
@@ -51,7 +62,59 @@ export async function requestCorrection(
     // fetch only fails like this when no answer arrives at all: offline, server down, and so on.
     return { ok: false, message: NETWORK_ERROR_MESSAGE };
   }
+  const usage = readUsageHeaders(response.headers);
+  return withUsage(await readResponse(response, events), usage);
+}
 
+/**
+ * Today's count for the line under the button, from GET /api/usage. Null when
+ * the site doesn't count corrections, or the count can't be read.
+ * It never throws.
+ */
+export async function fetchUsage(): Promise<DailyUsage | null> {
+  try {
+    const response = await fetch("/api/usage", { cache: "no-store" });
+    if (!response.ok) {
+      return null;
+    }
+    const body: unknown = await response.json();
+    return isObject(body) ? parseUsage(body.usage) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The friendly message for one of our API's errors, `{ code, message, … }`.
+ * For the limits it says exactly when to try again, in your own time zone.
+ * `fallback` is used when the error has no message.
+ */
+export function messageForError(
+  error: unknown,
+  fallback: string,
+  now = new Date(),
+  format: TimeFormat = {},
+): string {
+  if (!isObject(error)) {
+    return fallback;
+  }
+  const { code, period, limit, retryAfter } = error;
+  const resetAt =
+    typeof error.resetAt === "string" && !Number.isNaN(Date.parse(error.resetAt)) ? error.resetAt : undefined;
+  if (code === "LIMIT_REACHED" && period === "minute" && isPositiveWhole(retryAfter)) {
+    return `Too many corrections in one minute. Please wait ${retryAfter} ${retryAfter === 1 ? "second" : "seconds"}.`;
+  }
+  if (code === "LIMIT_REACHED" && period === "day" && isPositiveWhole(limit) && resetAt) {
+    return `You've used all ${formatCount(limit)} corrections for today. You can correct more from ${formatResetTime(resetAt, now, format)}.`;
+  }
+  if (code === "AI_DAILY_LIMIT" && resetAt) {
+    return `Today's free AI allowance is used up. You can correct more from ${formatResetTime(resetAt, now, format)}.`;
+  }
+  return typeof error.message === "string" && error.message ? error.message : fallback;
+}
+
+/** Reads the answer: the live answer, or JSON in one piece. */
+async function readResponse(response: Response, events: CorrectionEvents): Promise<CorrectionOutcome> {
   if (response.ok && response.body && isStream(response.headers.get("content-type"))) {
     return readStream(response.body, events);
   }
@@ -66,13 +129,17 @@ export async function requestCorrection(
 
   if (!response.ok) {
     // Our API's errors look like { error: { code, message } }.
-    const message = (body as ApiErrorBody | null)?.error?.message;
     return {
       ok: false,
-      message: typeof message === "string" && message ? message : messageForStatus(response.status),
+      message: messageForError(isObject(body) ? body.error : undefined, messageForStatus(response.status)),
     };
   }
   return checkResult(body);
+}
+
+/** Adds today's count to the outcome, when the answer had one. */
+function withUsage(outcome: CorrectionOutcome, usage: DailyUsage | null): CorrectionOutcome {
+  return usage ? { ...outcome, usage } : outcome;
 }
 
 /**
@@ -107,7 +174,7 @@ async function readStream(
         case "done":
           return checkResult(event.result);
         case "error":
-          return { ok: false, message: event.message || API_ERRORS.AI_ERROR.message };
+          return { ok: false, message: messageForError(event.error, API_ERRORS.AI_ERROR.message) };
       }
     }
   } catch {
@@ -148,7 +215,8 @@ type ParsedEvent =
   | { type: "text"; text: string }
   | { type: "restart" }
   | { type: "done"; result: unknown }
-  | { type: "error"; message: string };
+  /** `error` is the event's { code, message, … }, read by messageForError. */
+  | { type: "error"; error: unknown };
 
 /** Reads one line of the live answer. Empty or unreadable lines are skipped. */
 function parseEvent(line: string): ParsedEvent | null {
@@ -171,10 +239,8 @@ function parseEvent(line: string): ParsedEvent | null {
       return { type: "restart" };
     case "done":
       return { type: "done", result: value.result };
-    case "error": {
-      const message = isObject(value.error) ? value.error.message : undefined;
-      return { type: "error", message: typeof message === "string" ? message : "" };
-    }
+    case "error":
+      return { type: "error", error: value.error };
     default:
       return null;
   }
@@ -209,4 +275,8 @@ function messageForStatus(status: number): string {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isPositiveWhole(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0;
 }

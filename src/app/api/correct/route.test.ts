@@ -3,11 +3,15 @@ import { APIError, APIUserAbortError } from "@anthropic-ai/sdk";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { askGemini } from "@/lib/ai/gemini";
 import { API_ERRORS, CorrectionError, type ApiErrorCode } from "@/lib/api-errors";
+import { countCorrection } from "@/lib/limits";
 import { SAMPLE_WITH_FIXES } from "@/lib/sample-results";
 import { POST } from "./route";
 
 // The mock AI's pause is skipped, so the tests run instantly.
 vi.mock("@/lib/wait", () => ({ wait: vi.fn(async () => {}) }));
+
+// A fake count, so no test needs a database. limits.test.ts covers the counting.
+vi.mock("@/lib/limits", () => ({ countCorrection: vi.fn() }));
 
 // A fake Gemini call for the live answer's tests. gemini.test.ts covers the
 // Gemini code itself.
@@ -72,6 +76,7 @@ let consoleError: MockInstance<typeof console.error>;
 beforeEach(() => {
   vi.stubEnv("USE_MOCK_AI", "true");
   fakeStream.mockReset();
+  vi.mocked(countCorrection).mockReset().mockResolvedValue({ allowed: true, usage: null });
   // Failures are logged with console.error. Keep them out of the test output,
   // but record them so we can check what was logged.
   consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -373,6 +378,176 @@ describe("POST /api/correct", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
 
       expect(consoleError).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("limits", () => {
+    const MIDNIGHT = "2026-11-15T00:00:00.000Z";
+    const USAGE = { limit: 100, remaining: 87, resetAt: MIDNIGHT };
+    const MINUTE_LIMIT = {
+      allowed: false,
+      period: "minute",
+      limit: 10,
+      retryAfter: 20,
+      resetAt: "2026-11-14T03:26:00.000Z",
+      usage: { ...USAGE, remaining: 58 },
+    } as const;
+    let consoleInfo: MockInstance<typeof console.info>;
+    let consoleWarn: MockInstance<typeof console.warn>;
+
+    function postLive(body: unknown): Promise<Response> {
+      return POST(
+        new Request("http://localhost/api/correct", {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/x-ndjson" },
+          body: JSON.stringify(body),
+        }),
+      );
+    }
+
+    beforeEach(() => {
+      vi.stubEnv("USE_MOCK_AI", "false");
+      vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test-key");
+      consoleInfo = vi.spyOn(console, "info").mockImplementation(() => {});
+      consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      consoleInfo.mockRestore();
+      consoleWarn.mockRestore();
+    });
+
+    it("counts each correction and says how many are left today", async () => {
+      vi.mocked(countCorrection).mockResolvedValue({ allowed: true, usage: USAGE });
+      claudeAnswers({});
+
+      const response = await post({ text: "He go to office every days." });
+
+      expect(response.status).toBe(200);
+      expect(countCorrection).toHaveBeenCalledOnce();
+      expect(response.headers.get("x-daily-limit")).toBe("100");
+      expect(response.headers.get("x-daily-remaining")).toBe("87");
+      expect(response.headers.get("x-daily-reset")).toBe(MIDNIGHT);
+    });
+
+    it("sends the count with the live answer and with a failed correction", async () => {
+      vi.mocked(countCorrection).mockResolvedValue({ allowed: true, usage: USAGE });
+      claudeAnswers({});
+      const live = await postLive({ text: "Hello" });
+      claudeAnswers({ content: [], stop_reason: "refusal" });
+      const failed = await post({ text: "Hello" });
+
+      expect(live.headers.get("content-type")).toBe("application/x-ndjson; charset=utf-8");
+      expect(live.headers.get("x-daily-remaining")).toBe("87");
+      expect(failed.status).toBe(422);
+      expect(failed.headers.get("x-daily-remaining")).toBe("87");
+    });
+
+    it("sends no count when corrections aren't counted", async () => {
+      claudeAnswers({});
+      const response = await post({ text: "Hello" });
+      expect(response.headers.get("x-daily-limit")).toBeNull();
+    });
+
+    it("answers 429 with Retry-After once the limit per minute is reached, without asking the AI", async () => {
+      vi.mocked(countCorrection).mockResolvedValue(MINUTE_LIMIT);
+
+      const response = await post({ text: "Hello" });
+
+      expect(response.status).toBe(429);
+      expect(response.headers.get("retry-after")).toBe("20");
+      expect(response.headers.get("x-daily-remaining")).toBe("58");
+      expect(await response.json()).toEqual({
+        error: {
+          code: "LIMIT_REACHED",
+          message: API_ERRORS.LIMIT_REACHED.message,
+          period: "minute",
+          limit: 10,
+          retryAfter: 20,
+          resetAt: "2026-11-14T03:26:00.000Z",
+        },
+      });
+      expect(fakeStream).not.toHaveBeenCalled();
+      expect(consoleWarn).toHaveBeenCalledWith(
+        "[api/correct] LIMIT_REACHED: the limit of 10 corrections per minute",
+      );
+    });
+
+    it("answers the day's limit with a JSON 429, even when the live answer was asked for", async () => {
+      vi.mocked(countCorrection).mockResolvedValue({
+        allowed: false,
+        period: "day",
+        limit: 100,
+        retryAfter: 74_060,
+        resetAt: MIDNIGHT,
+        usage: { ...USAGE, remaining: 0 },
+      });
+
+      const response = await postLive({ text: "Hello" });
+
+      expect(response.status).toBe(429);
+      expect(response.headers.get("content-type")).toContain("application/json");
+      expect(response.headers.get("retry-after")).toBe("74060");
+      expect(await response.json()).toMatchObject({
+        error: { code: "LIMIT_REACHED", period: "day", limit: 100, resetAt: MIDNIGHT },
+      });
+    });
+
+    it("doesn't count a text that fails its checks", async () => {
+      await post({ text: "   " });
+      await post({ text: "a".repeat(5001) });
+      expect(countCorrection).not.toHaveBeenCalled();
+    });
+
+    it("doesn't count sample answers in mock mode", async () => {
+      vi.stubEnv("USE_MOCK_AI", "true");
+      const response = await post({ text: "Hello" });
+      expect(response.status).toBe(200);
+      expect(countCorrection).not.toHaveBeenCalled();
+    });
+
+    describe("when Gemini's free daily allowance is used up", () => {
+      const used = () =>
+        new CorrectionError("AI_DAILY_LIMIT", "Gemini API error 429, RESOURCE_EXHAUSTED", {
+          retryAfter: 3_600,
+          resetAt: "2026-11-14T08:00:00.000Z",
+        });
+
+      beforeEach(() => {
+        vi.stubEnv("ANTHROPIC_API_KEY", "");
+        vi.stubEnv("AI_PROVIDER", "gemini");
+        vi.mocked(askGemini).mockReset().mockRejectedValueOnce(used()).mockRejectedValueOnce(used());
+      });
+
+      it("says when it comes back, in the JSON answer", async () => {
+        const response = await post({ text: "Hello" });
+
+        expect(response.status).toBe(429);
+        expect(response.headers.get("retry-after")).toBe("3600");
+        expect(await response.json()).toEqual({
+          error: {
+            code: "AI_DAILY_LIMIT",
+            message: API_ERRORS.AI_DAILY_LIMIT.message,
+            retryAfter: 3_600,
+            resetAt: "2026-11-14T08:00:00.000Z",
+          },
+        });
+      });
+
+      it("says when it comes back, in the live answer's error event", async () => {
+        const text = await (await postLive({ text: "Hello" })).text();
+        const last = JSON.parse(text.trimEnd().split("\n").at(-1)!);
+
+        expect(last).toEqual({
+          type: "error",
+          error: {
+            code: "AI_DAILY_LIMIT",
+            message: API_ERRORS.AI_DAILY_LIMIT.message,
+            retryAfter: 3_600,
+            resetAt: "2026-11-14T08:00:00.000Z",
+          },
+        });
+      });
     });
   });
 

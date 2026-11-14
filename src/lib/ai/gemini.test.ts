@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { ApiError, BlockedReason, FinishReason, GenerateContentResponse } from "@google/genai";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
-import type { ApiErrorCode } from "@/lib/api-errors";
+import type { ApiErrorCode, CorrectionError } from "@/lib/api-errors";
 import { SAMPLE_WITH_FIXES } from "@/lib/sample-results";
 import { MAX_INPUT_LENGTH } from "@/lib/validation";
 import { ANSWER_JSON_SCHEMA } from "./answer-schema";
@@ -406,6 +406,69 @@ describe("askGemini", () => {
       failsWith(makeError());
 
       await expect(askGemini(TEXT)).rejects.toThrow(correctionError(code));
+    });
+
+    describe("a 429 for a used-up daily allowance", () => {
+      /** Google's answer when the free daily allowance is used up, shaped like a real one. */
+      function dailyLimitError(details?: Record<string, unknown>[]) {
+        return new ApiError({
+          message: JSON.stringify({
+            error: {
+              code: 429,
+              message: "You exceeded your current quota, please check your plan and billing details.",
+              status: "RESOURCE_EXHAUSTED",
+              details: details ?? [
+                {
+                  "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                  violations: [
+                    {
+                      quotaMetric: "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+                      quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                      quotaValue: "500",
+                    },
+                  ],
+                },
+                { "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "20164.5s" },
+              ],
+            },
+          }),
+          status: 429,
+        });
+      }
+
+      it("fails with AI_DAILY_LIMIT and says when the allowance comes back", async () => {
+        vi.useFakeTimers({ now: new Date("2026-11-14T02:23:55.000Z"), toFake: ["Date"] });
+        failsWith(dailyLimitError());
+
+        const error = await askGemini(TEXT).catch((caught: unknown) => caught);
+
+        expect(error).toEqual(correctionError("AI_DAILY_LIMIT"));
+        expect((error as CorrectionError).retry).toEqual({
+          retryAfter: 20_165,
+          resetAt: "2026-11-14T08:00:00.000Z",
+        });
+        expect((error as Error).message).toContain("daily allowance used up");
+        vi.useRealTimers();
+      });
+
+      it("fails with AI_DAILY_LIMIT without a time when Google gives none", async () => {
+        failsWith(dailyLimitError([{ violations: [{ quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier" }] }]));
+
+        const error = await askGemini(TEXT).catch((caught: unknown) => caught);
+        expect(error).toEqual(correctionError("AI_DAILY_LIMIT"));
+        expect((error as CorrectionError).retry).toBeUndefined();
+      });
+
+      it("stays RATE_LIMITED when only the limit per minute was reached", async () => {
+        failsWith(
+          dailyLimitError([
+            { violations: [{ quotaId: "GenerateRequestsPerMinutePerProjectPerModel-FreeTier" }] },
+            { retryDelay: "12s" },
+          ]),
+        );
+
+        await expect(askGemini(TEXT)).rejects.toThrow(correctionError("RATE_LIMITED"));
+      });
     });
 
     it("every try running out of time fails with AI_TIMEOUT, and the log says how many tries", async () => {

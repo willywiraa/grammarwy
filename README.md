@@ -20,12 +20,13 @@ Each version has its own **Copy** button. If your text is already correct, the a
 - **American English:** British spellings are changed to American ones, with a short explanation.
 - **Nothing is stored:** the app keeps no copy of your text, and the server logs never contain it.
 - **Password-protected online:** the whole site sits behind a password, so strangers can't use it.
+- **Usage limits:** at most 10 corrections a minute and 100 a day (you can change both), with today's count under the button.
 - **Works on desktop and phone**, with a simple single-column layout.
-- **Tested:** about 250 automatic tests, plus optional checks against the real AI.
+- **Tested:** about 400 automatic tests, plus optional checks against the real AI.
 
 ## Built with
 
-[Next.js 16](https://nextjs.org) (App Router) · React 19 · TypeScript · Tailwind CSS 4 · [Zod](https://zod.dev) · the [Anthropic TypeScript SDK](https://github.com/anthropics/anthropic-sdk-typescript) · the [Google Gen AI SDK](https://github.com/googleapis/js-genai) · Vitest and React Testing Library · [Vercel](https://vercel.com) for hosting
+[Next.js 16](https://nextjs.org) (App Router) · React 19 · TypeScript · Tailwind CSS 4 · [Zod](https://zod.dev) · the [Anthropic TypeScript SDK](https://github.com/anthropics/anthropic-sdk-typescript) · the [Google Gen AI SDK](https://github.com/googleapis/js-genai) · [Upstash Redis](https://upstash.com/docs/redis) for the usage limits · Vitest and React Testing Library · [Vercel](https://vercel.com) for hosting
 
 ## How it works
 
@@ -107,6 +108,9 @@ Settings go in `.env.local` on your computer, or in the project settings on Verc
 | `ANTHROPIC_MODEL` | No | Another Claude model (default: `claude-opus-5-5`) |
 | `ANTHROPIC_EFFORT` | No | How much Claude thinks: `low` (default), `medium`, `high`, `xhigh` or `max` |
 | `BASIC_AUTH_USER`, `BASIC_AUTH_PASSWORD` | Online | The site's user name and password. Leave both empty for `npm run dev`. |
+| `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | For the usage limits | Your Upstash database. Vercel's Upstash integration may name them `KV_REST_API_URL` and `KV_REST_API_TOKEN`; both names work. Without them, corrections aren't counted or limited. |
+| `LIMIT_PER_MINUTE` | No | Corrections allowed per minute, for the whole site (default: `10`) |
+| `LIMIT_PER_DAY` | No | Corrections allowed per day, for the whole site (default: `100`). The day starts at 00:00 UTC. |
 
 ## Password protection
 
@@ -117,13 +121,28 @@ Online, every page and API request needs the site password. Your browser shows i
 - Use a long random password, for example 20 or more characters from a password manager.
 - To log out, close the browser.
 
+## Usage limits
+
+The site counts corrections in a small [Upstash Redis](https://upstash.com) database, whose free plan is enough. The limits are for the whole site, not per person: they stop runaway use, for example if the password leaks, and keep the AI within its free allowance.
+
+- **Per minute:** 10 corrections by default (`LIMIT_PER_MINUTE`).
+- **Per day:** 100 corrections by default (`LIMIT_PER_DAY`). The day starts at 00:00 UTC, and the page shows that time in your own time zone.
+- **Today's count** shows under the button, for example "87 of 100 corrections left today".
+- **Over a limit,** the page says how long to wait, for example "Too many corrections in one minute. Please wait 20 seconds." Corrections that are turned away aren't counted.
+- **The limits never stop corrections by mistake.** If no database is set up, or it doesn't answer within 1 second, the correction goes ahead uncounted and the server log says why.
+- Counters are kept apart for production, preview and development, so trying things on your computer doesn't use up the live site's count.
+- Sample answers (`USE_MOCK_AI=true`) aren't counted.
+
+When Gemini's own free daily allowance runs out on both models, the page says so and tells you when it comes back, instead of saying the AI is busy.
+
 ## Deploy to Vercel
 
 1. Fork or import this repository in [Vercel](https://vercel.com/new). The free Hobby plan is enough.
 2. Under **Settings → Environment Variables**, set `BASIC_AUTH_USER` and `BASIC_AUTH_PASSWORD`, plus one AI key for real corrections. A hosted site can't use a Claude subscription, so it needs an API key:
    - `GEMINI_API_KEY` for free corrections with Gemini, or
    - `ANTHROPIC_API_KEY` for Claude, billed per use.
-3. Deploy. Every push to `main` deploys again. After you change a setting, redeploy so it takes effect.
+3. For the usage limits, open **Storage** in your Vercel project, add **Upstash for Redis** on the free plan (in the region closest to your server), and connect it to the project. It adds the database settings by itself.
+4. Deploy. Every push to `main` deploys again. After you change a setting, redeploy so it takes effect.
 
 The server code runs in Vercel's Singapore region (`sin1`), set in `vercel.json`. The Hobby plan runs it in one region, so if you're far from Singapore, change it to the [region](https://vercel.com/docs/regions) closest to you.
 
@@ -142,7 +161,7 @@ No API key yet? Set `USE_MOCK_AI=true` instead, and the site shows sample answer
 
 ## Privacy
 
-Your text is sent to Anthropic or Google, depending on the connection, to be corrected. The app itself stores nothing, and its logs hold only technical data such as length, timing and token counts. Avoid pasting passwords, credentials or other people's personal data.
+Your text is sent to Anthropic or Google, depending on the connection, to be corrected. The app itself stores nothing, and its logs hold only technical data such as length, timing and token counts. The usage-limit database holds only how many corrections were made in the current minute and day. Avoid pasting passwords, credentials or other people's personal data.
 
 **Gemini's free tier:** Google may use the texts you send to improve its products, and human reviewers may read them. Don't send confidential or personal information there. On Google's paid tier, your texts aren't used this way.
 

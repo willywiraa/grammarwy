@@ -1,5 +1,5 @@
 import { Allow, parse } from "partial-json";
-import type { ApiErrorCode } from "@/lib/api-errors";
+import type { ApiErrorCode, RetryInfo } from "@/lib/api-errors";
 import type { CorrectionResult } from "@/lib/correction-schema";
 
 // The live answer of POST /api/correct. When the page asks for it (with the
@@ -17,8 +17,11 @@ export type StreamEvent =
   | { type: "restart" }
   /** The final result, checked by the server. It replaces everything shown so far. */
   | { type: "done"; result: CorrectionResult }
-  /** The correction failed. The message is the friendly one from API_ERRORS. */
-  | { type: "error"; error: { code: ApiErrorCode; message: string } };
+  /**
+   * The correction failed. The message is the friendly one from API_ERRORS.
+   * AI_DAILY_LIMIT also says when Gemini's allowance comes back.
+   */
+  | { type: "error"; error: { code: ApiErrorCode; message: string } & RetryInfo };
 
 /** The four versions, in the order the AI writes them. */
 export const VERSION_FIELDS = [

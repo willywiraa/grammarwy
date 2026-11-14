@@ -2,7 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { API_ERRORS } from "@/lib/api-errors";
 import type { PartialAnswer, StreamEvent } from "@/lib/correction-stream";
 import { SAMPLE_WITH_FIXES } from "@/lib/sample-results";
-import { ANSWER_STOPPED_MESSAGE, NETWORK_ERROR_MESSAGE, requestCorrection } from "./api-client";
+import { usageHeaders } from "@/lib/usage";
+import {
+  ANSWER_STOPPED_MESSAGE,
+  fetchUsage,
+  messageForError,
+  NETWORK_ERROR_MESSAGE,
+  requestCorrection,
+} from "./api-client";
 
 // The tests replace the browser's fetch, so no real requests are sent.
 const fetchMock = vi.fn<typeof fetch>();
@@ -250,5 +257,141 @@ describe("requestCorrection", () => {
         message: ANSWER_STOPPED_MESSAGE,
       });
     });
+  });
+});
+
+describe("today's count", () => {
+  const USAGE = { limit: 100, remaining: 87, resetAt: "2026-11-15T00:00:00.000Z" };
+
+  it("comes with the result, from the answer's headers", async () => {
+    fetchMock.mockResolvedValue(
+      Response.json(SAMPLE_WITH_FIXES.result, { headers: usageHeaders(USAGE) }),
+    );
+    await expect(requestCorrection("Hello")).resolves.toEqual({
+      ok: true,
+      result: SAMPLE_WITH_FIXES.result,
+      usage: USAGE,
+    });
+  });
+
+  it("comes with the live answer, and with a failed correction", async () => {
+    const live = new Response(line({ type: "done", result: SAMPLE_WITH_FIXES.result }), {
+      headers: { "Content-Type": "application/x-ndjson", ...usageHeaders(USAGE) },
+    });
+    fetchMock.mockResolvedValueOnce(live).mockResolvedValueOnce(
+      Response.json(
+        { error: { code: "AI_REFUSED", message: API_ERRORS.AI_REFUSED.message } },
+        { status: 422, headers: usageHeaders(USAGE) },
+      ),
+    );
+
+    await expect(requestCorrection("Hello")).resolves.toMatchObject({ ok: true, usage: USAGE });
+    await expect(requestCorrection("Hello")).resolves.toEqual({
+      ok: false,
+      message: API_ERRORS.AI_REFUSED.message,
+      usage: USAGE,
+    });
+  });
+});
+
+describe("messageForError", () => {
+  // 10:00 in Jakarta, 7 hours ahead of UTC.
+  const NOW = new Date("2026-11-14T03:00:00.000Z");
+  const JAKARTA = { locale: "en-GB", timeZone: "Asia/Jakarta" };
+  const limit = (fields: Record<string, unknown>) => ({
+    code: "LIMIT_REACHED",
+    message: API_ERRORS.LIMIT_REACHED.message,
+    ...fields,
+  });
+
+  it("says how long to wait after too many corrections in one minute", () => {
+    expect(messageForError(limit({ period: "minute", limit: 10, retryAfter: 20 }), "x")).toBe(
+      "Too many corrections in one minute. Please wait 20 seconds.",
+    );
+    expect(messageForError(limit({ period: "minute", limit: 10, retryAfter: 1 }), "x")).toBe(
+      "Too many corrections in one minute. Please wait 1 second.",
+    );
+  });
+
+  it("says when more corrections are possible after the day's limit, in your own time", () => {
+    const error = limit({ period: "day", limit: 1000, retryAfter: 75_600, resetAt: "2026-11-15T00:00:00.000Z" });
+    expect(messageForError(error, "x", NOW, JAKARTA)).toBe(
+      "You've used all 1,000 corrections for today. You can correct more from 7:00 tomorrow.",
+    );
+  });
+
+  it("says when Gemini's free daily allowance comes back", () => {
+    const error = {
+      code: "AI_DAILY_LIMIT",
+      message: API_ERRORS.AI_DAILY_LIMIT.message,
+      retryAfter: 18_000,
+      resetAt: "2026-11-14T08:00:00.000Z",
+    };
+    expect(messageForError(error, "x", NOW, JAKARTA)).toBe(
+      "Today's free AI allowance is used up. You can correct more from 15:00.",
+    );
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ["no wait time", limit({ period: "minute" })],
+    ["a wait time that isn't a whole number", limit({ period: "minute", retryAfter: "20" })],
+    ["no reset time", limit({ period: "day", limit: 100 })],
+    ["a reset time that isn't a time", limit({ period: "day", limit: 100, resetAt: "tomorrow" })],
+    ["an unknown period", limit({ period: "week", retryAfter: 20 })],
+  ])("falls back to the server's message with %s", (_, error) => {
+    expect(messageForError(error, "x")).toBe(API_ERRORS.LIMIT_REACHED.message);
+  });
+
+  it("uses the error's own message for other errors, or the fallback", () => {
+    expect(messageForError({ code: "AI_ERROR", message: "From the server" }, "x")).toBe("From the server");
+    expect(messageForError({ code: "AI_ERROR", message: "" }, "Fallback")).toBe("Fallback");
+    expect(messageForError("not an object", "Fallback")).toBe("Fallback");
+  });
+
+  it("is used for a 429 from the API and for the live answer's error event", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        Response.json({ error: limit({ period: "minute", limit: 10, retryAfter: 20 }) }, { status: 429 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          line({
+            type: "error",
+            error: { code: "AI_DAILY_LIMIT", message: "x", retryAfter: 60, resetAt: "2026-11-14T08:00:00.000Z" },
+          }),
+          { headers: { "Content-Type": "application/x-ndjson" } },
+        ),
+      );
+
+    await expect(requestCorrection("Hello")).resolves.toEqual({
+      ok: false,
+      message: "Too many corrections in one minute. Please wait 20 seconds.",
+    });
+    const outcome = await requestCorrection("Hello");
+    expect(outcome.ok === false && outcome.message).toMatch(
+      /^Today's free AI allowance is used up\. You can correct more from .+\.$/,
+    );
+  });
+});
+
+describe("fetchUsage", () => {
+  const USAGE = { limit: 100, remaining: 87, resetAt: "2026-11-15T00:00:00.000Z" };
+
+  it("asks GET /api/usage for today's count, fresh every time", async () => {
+    fetchMock.mockResolvedValue(Response.json({ usage: USAGE }));
+
+    await expect(fetchUsage()).resolves.toEqual(USAGE);
+    expect(fetchMock).toHaveBeenCalledWith("/api/usage", { cache: "no-store" });
+  });
+
+  it.each<[string, () => Promise<Response>]>([
+    ["corrections aren't counted", async () => Response.json({ usage: null })],
+    ["the count is in the wrong format", async () => Response.json({ usage: { limit: "100" } })],
+    ["the answer isn't JSON", async () => new Response("<html>")],
+    ["the server answers with an error", async () => Response.json({ usage: USAGE }, { status: 500 })],
+    ["the network fails", async () => Promise.reject(new TypeError("Failed to fetch"))],
+  ])("gives null when %s", async (_, answer) => {
+    fetchMock.mockImplementation(answer);
+    await expect(fetchUsage()).resolves.toBeNull();
   });
 });

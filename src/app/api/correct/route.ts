@@ -1,6 +1,8 @@
-import { getCorrection } from "@/lib/ai";
-import { API_ERRORS, CorrectionError, type ApiErrorCode } from "@/lib/api-errors";
+import { getCorrection, isMockMode } from "@/lib/ai";
+import { API_ERRORS, CorrectionError, type ApiErrorCode, type RetryInfo } from "@/lib/api-errors";
 import { STREAM_CONTENT_TYPE, type StreamEvent } from "@/lib/correction-stream";
+import { countCorrection, type LimitDecision } from "@/lib/limits";
+import { usageHeaders } from "@/lib/usage";
 import { checkText } from "@/lib/validation";
 
 /**
@@ -23,6 +25,10 @@ export const maxDuration = 300;
  * pieces of the AI's answer as it writes them, then the checked result, or an
  * error event if the correction fails. A request that fails the checks still
  * gets a JSON error with its status.
+ *
+ * Every correction is counted against the site's limits (lib/limits.ts).
+ * Once a limit is reached, the answer is a 429 with the code LIMIT_REACHED.
+ * The X-Daily-* headers say how many corrections are left today.
  */
 export async function POST(request: Request): Promise<Response> {
   // 1. Only JSON is accepted. This also blocks form posts from other websites.
@@ -44,16 +50,25 @@ export async function POST(request: Request): Promise<Response> {
     return errorResponse(check.code);
   }
 
-  // 4. Correct it, live or in one answer. Details of any failure go to the
+  // 4. Count the correction, unless a limit is reached. Sample answers in mock
+  //    mode cost nothing, so they aren't counted.
+  const decision: LimitDecision = isMockMode() ? { allowed: true, usage: null } : await countCorrection();
+  if (!decision.allowed) {
+    return limitResponse(decision);
+  }
+  const headers = usageHeaders(decision.usage);
+
+  // 5. Correct it, live or in one answer. Details of any failure go to the
   //    server log, never to the browser, and the user's text is never logged.
   if (acceptsStream(request.headers.get("accept"))) {
-    return streamCorrection(check.text);
+    return streamCorrection(check.text, headers);
   }
   try {
     const result = await getCorrection(check.text);
-    return Response.json(result);
+    return Response.json(result, { headers });
   } catch (error) {
-    return errorResponse(logFailure(error));
+    const { code, retry } = logFailure(error);
+    return errorResponse(code, retry, headers);
   }
 }
 
@@ -62,7 +77,7 @@ export async function POST(request: Request): Promise<Response> {
  * status is already 200 when the answer starts, so a failure arrives as an
  * "error" event.
  */
-function streamCorrection(text: string): Response {
+function streamCorrection(text: string, headers: Record<string, string>): Response {
   const encoder = new TextEncoder();
   // True once the browser stops reading, for example when the page is closed.
   let closed = false;
@@ -87,8 +102,8 @@ function streamCorrection(text: string): Response {
         });
         send({ type: "done", result });
       } catch (error) {
-        const code = logFailure(error);
-        send({ type: "error", error: { code, message: API_ERRORS[code].message } });
+        const { code, retry } = logFailure(error);
+        send({ type: "error", error: { code, message: API_ERRORS[code].message, ...retry } });
       }
       if (!closed) {
         controller.close();
@@ -105,23 +120,37 @@ function streamCorrection(text: string): Response {
       // Nothing between the server and the page may store the answer or hold it back.
       "Cache-Control": "no-store, no-transform",
       "X-Accel-Buffering": "no",
+      ...headers,
     },
   });
 }
 
-/** Writes a failure's details to the server log and returns the code to answer with. */
-function logFailure(error: unknown): ApiErrorCode {
-  if (error instanceof CorrectionError) {
-    console.error(`[api/correct] ${error.code}: ${error.message}`);
-    return error.code;
-  }
-  console.error("[api/correct] Unexpected error:", error);
-  return "AI_ERROR";
+/** A 429 that says which limit was reached and when corrections are possible again. */
+function limitResponse(decision: Extract<LimitDecision, { allowed: false }>): Response {
+  const { period, limit, retryAfter, resetAt, usage } = decision;
+  console.warn(`[api/correct] LIMIT_REACHED: the limit of ${limit} corrections per ${period}`);
+  return errorResponse("LIMIT_REACHED", { period, limit, retryAfter, resetAt }, usageHeaders(usage));
 }
 
-function errorResponse(code: ApiErrorCode): Response {
+/** Writes a failure's details to the server log and returns what to answer with. */
+function logFailure(error: unknown): { code: ApiErrorCode; retry?: RetryInfo } {
+  if (error instanceof CorrectionError) {
+    console.error(`[api/correct] ${error.code}: ${error.message}`);
+    return { code: error.code, retry: error.retry };
+  }
+  console.error("[api/correct] Unexpected error:", error);
+  return { code: "AI_ERROR" };
+}
+
+function errorResponse(code: ApiErrorCode, retry: RetryInfo = {}, headers: Record<string, string> = {}): Response {
   const { status, message } = API_ERRORS[code];
-  return Response.json({ error: { code, message } }, { status });
+  return Response.json(
+    { error: { code, message, ...retry } },
+    {
+      status,
+      headers: retry.retryAfter ? { "Retry-After": String(retry.retryAfter), ...headers } : headers,
+    },
+  );
 }
 
 /** True for "application/json", with or without "; charset=utf-8". */

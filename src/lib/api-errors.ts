@@ -24,6 +24,18 @@ export const API_ERRORS = {
     status: 429,
     message: "The AI service is busy. Please wait a moment and try again.",
   },
+  // The site's own limits (lib/limits.ts). The page shows a more exact message
+  // from the error's period, limit, retryAfter and resetAt.
+  LIMIT_REACHED: {
+    status: 429,
+    message: "You've reached the correction limit for now. Please try again later.",
+  },
+  // Gemini's free daily allowance is used up on every model. The page says
+  // when it comes back, from the error's resetAt.
+  AI_DAILY_LIMIT: {
+    status: 429,
+    message: "Today's free AI allowance is used up. Please try again later.",
+  },
   SERVER_CONFIG: {
     status: 500,
     message:
@@ -54,21 +66,39 @@ export const API_ERRORS = {
 
 export type ApiErrorCode = keyof typeof API_ERRORS;
 
+/**
+ * When a correction is possible again. Only the errors for a limit carry it:
+ * LIMIT_REACHED all four fields, AI_DAILY_LIMIT retryAfter and resetAt.
+ */
+export type RetryInfo = {
+  /** Which of the site's limits was reached. */
+  period?: "minute" | "day";
+  /** How many corrections that limit allows. */
+  limit?: number;
+  /** Seconds until a correction is possible again. */
+  retryAfter?: number;
+  /** When a correction is possible again, as an ISO time. */
+  resetAt?: string;
+};
+
 /** The JSON body of every error answer. */
 export type ApiErrorBody = {
-  error: { code: ApiErrorCode; message: string };
+  error: { code: ApiErrorCode; message: string } & RetryInfo;
 };
 
 /**
  * Thrown when a correction fails. `code` decides what the browser sees.
  * `message` holds the technical details, which only go to the server log.
+ * `retry` says when to try again, for the errors that know it.
  */
 export class CorrectionError extends Error {
   readonly code: ApiErrorCode;
+  readonly retry?: RetryInfo;
 
-  constructor(code: ApiErrorCode, details: string) {
+  constructor(code: ApiErrorCode, details: string, retry?: RetryInfo) {
     super(details);
     this.name = "CorrectionError";
     this.code = code;
+    this.retry = retry;
   }
 }
